@@ -276,11 +276,12 @@ orch init SLUG -s 1..4 [-H h -m m -e e]      new run under .orch/ (git-excluded)
 orch start NAME --task-file F [-H -m -e] [--worktree] [--scope GLOBS] [--protect GLOBS]
            [--protect-existing-tests] [--read-only] [--max-minutes N] [--skills a,b]
 orch watch [--timeout S] [--workers a,b]     block until activity / alert / finish → condensed feed
+orch wait [--workers a,b] [--all] [--timeout S]   block until a worker (or all) stops; no activity wake-ups
 orch steer NAME "msg" [--mode hook|soft|hard]
 orch resume NAME "msg" | --message-file F    next round on the same session (feedback)
 orch status | log NAME [--full] | diff NAME [--stat] | doc NAME
 orch update NAME [--scope G] [--add-protect G] [--unprotect G]   live scope/protection change
-orch stop NAME|all | merge NAME | clean [--branches]
+orch stop NAME|all | merge NAME | clean [--branches]   (clean keeps run logs and copies worklogs out first)
 ```
 
 ```text
