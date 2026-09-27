@@ -179,6 +179,34 @@ Claude doesn't commit or push unless you ask.
 
 ---
 
+## A real run, end to end
+
+This is an actual test run. The orchestrator is Claude Sonnet running `/orch`; the worker is Claude Haiku
+(effort low); strictness is 3. All artifacts are in
+[`examples/slugkit-strict-run/`](examples/slugkit-strict-run/).
+
+```text
+/orch slugify() must transliterate accented Latin characters ("Crème Brûlée" -> "creme-brulee",
+      "Straße" -> "strasse") and gain max_length that truncates at a word boundary; expose --max-length N.
+```
+
+| ≈ min | Orchestrator | Worker |
+|---|---|---|
+| 0:00 | Scans the repo, records the baseline (2/2 tests green), `orch init -s 3` | |
+| 0:02 | Writes [PLAN.md](examples/slugkit-strict-run/PLAN.md): 7 definition-of-done items, 7 **held-out** edge cases; writes the [brief](examples/slugkit-strict-run/brief-w1.md); `orch smoke claude -m haiku` ✅ | |
+| 0:03 | `orch start w1 --protect-existing-tests --scope 'slugkit/**,…'` | starts: NFKD transliteration, `max_length` |
+| 0:04 | `watch` shows the guard blocking an edit to the protected test file. The protection was too broad (the brief asked for tests to be added there), so the orchestrator widens it live and steers: *"you may now ADD tests; don't touch the 2 existing assertions"* | adapts after its next tool call |
+| 0:07 | | `ORCH_STATUS: DONE`: "all tests pass" |
+| 0:08 | **Review round 1.** Every definition-of-done command passes *as written*, but the held-out checks fail: `slugify("Ã")` → `"ss"` (the worker had hard-coded `replace("Ã","ss")`), and `slugify("ab cd ef", max_length=5)` → `"ab"` instead of `"ab-cd"`. A fresh-context **reviewer subagent** confirms both and adds a third: negative `max_length` silently eats characters | |
+| 0:09 | Verdict **REVISE**. [Feedback](examples/slugkit-strict-run/feedback-r1.md): 3 blocking items with the failing input, the expected output and the root cause | round 2: fixes all three and adds regression tests |
+| 0:11 | **Review round 2.** Re-runs everything itself: 10/10 tests pass, the 2 original tests are untouched, all 7 held-out checks pass. The [worklog](examples/slugkit-strict-run/WORKLOG-w1.md) documents the tests but skipped the README, so the orchestrator **adds the README note itself** | |
+| 0:12 | **ACCEPT**. Writes the [REPORT.md](examples/slugkit-strict-run/REPORT.md): definition of done 7/7 ✅ with evidence, open issues (æ/ø/ł are out of scope), not committed | |
+
+Cost: worker $0.78 + orchestrator $1.22. The worker's own "done" hid **two high-severity bugs** that
+the literal acceptance commands didn't catch. The held-out checks and the independent reviewer did.
+
+---
+
 ## Strictness
 
 One setting controls both how closely Claude watches and how hard it judges.
@@ -251,6 +279,7 @@ orch watch [--timeout S] [--workers a,b]     block until activity / alert / fini
 orch steer NAME "msg" [--mode hook|soft|hard]
 orch resume NAME "msg" | --message-file F    next round on the same session (feedback)
 orch status | log NAME [--full] | diff NAME [--stat] | doc NAME
+orch update NAME [--scope G] [--add-protect G] [--unprotect G]   live scope/protection change
 orch stop NAME|all | merge NAME | clean [--branches]
 ```
 

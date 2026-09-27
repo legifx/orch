@@ -41,6 +41,8 @@ code before the plan is approved.
 Rules of thumb:
 - One brief = one coherent deliverable. If a brief needs "and also …" three times, split it.
 - Name exact commands, not "make sure tests pass".
+- With protected tests (`--protect-existing-tests`), say where new tests go: "add new tests in
+  `tests/test_<feature>.py`; existing test files are read-only".
 - Keep held-out checks out of the brief. If a worker knows the exact probe, it can special-case it.
 - For parallel workers, give each brief the other workers' scopes as "Out of scope".
 - When re-briefing after a failed worker, add a `## Lessons so far` section listing what failed and why.

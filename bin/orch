@@ -1213,6 +1213,21 @@ def stop_worker(w):
     refresh(w)
 
 
+def cmd_update(a):
+    """Change scope/protection of a (running) worker - hooks read worker.json on every call."""
+    rd = run_dir(project_root(a.dir), a.run)
+    w = load_worker(rd / "workers" / a.name)
+    split = lambda v: [g.strip() for g in (v or "").split(",") if g.strip()]  # noqa: E731
+    if a.scope is not None:
+        w["scope"] = split(a.scope)
+    if a.protect is not None:
+        w["protect"] = split(a.protect)
+    w["protect"] = [g for g in w.get("protect", []) + split(a.add_protect) if g not in split(a.unprotect)]
+    save_worker(w)
+    print(f"UPDATED {a.name}: scope={w['scope'] or 'any'} protect={w['protect'] or 'none'}")
+    print("  (Claude workers: effective at the next tool call. Tell the worker with `orch steer` if it matters.)")
+
+
 def cmd_stop(a):
     root = project_root(a.dir)
     rd = run_dir(root, a.run)
@@ -1291,8 +1306,9 @@ def guard(w, tool, inp):
         if str(Path(w["cwd"], path)) != wl and any(fnmatch.fnmatch(rel, g) for g in protect):
             if w.get("read_only"):
                 return "you are a read-only reviewer: report findings in your worklog and final message, do not edit files."
-            return (f"{rel} is protected (read-only for workers). If you believe it is wrong, explain why in your "
-                    "worklog under Open issues and continue - the orchestrator decides.")
+            return (f"{rel} is protected (read-only for workers). New tests belong in a NEW file next to it "
+                    f"(e.g. {Path(rel).parent / ('test_orch_' + w['name'] + Path(rel).suffix)}). If you believe the "
+                    "protected file is wrong, explain why in your worklog under Open issues and continue.")
     if t in SHELL_TOOLS:
         cmd = str(inp.get("command", ""))
         roots = {g.split("*")[0].rstrip("/") for g in protect if g.split("*")[0].strip("/")}
@@ -1334,7 +1350,7 @@ def cmd_hook(a):
     w = rjson(wd / "worker.json", {})
     run = rjson(wd.parent.parent / "run.json", {})
     prof = STRICTNESS.get(run.get("strictness", 2), STRICTNESS[2])
-    if prof["enforce_worklog"] and not payload.get("stop_hook_active") and w:
+    if run and prof["enforce_worklog"] and not payload.get("stop_hook_active") and w:
         wl = worklog_path(w)
         started = w.get("started") or 0
         if not wl.exists() or wl.stat().st_mtime < started:
@@ -1405,7 +1421,11 @@ def cmd_watch(a):
                 finished.add(w["name"])
             if st.get("last_event"):
                 st["idle_warned"] = st.get("idle_warned") and now() - st["last_event"] > prof["idle"]
-            save_worker(w)
+            fresh = load_worker(wdir)
+            for key in ("session_id", "cost_usd", "worker_status"):
+                if w.get(key) is not None and fresh.get("round") == w.get("round"):
+                    fresh[key] = w[key]
+            save_worker(fresh)
             wjson(wdir / "watch.json", st)
         n_lines = sum(len(v) for v in buf.values())
         if alerts or finished or (now() - t0 >= timeout) or (n_lines >= a.max_lines):
@@ -1606,7 +1626,14 @@ def cmd_help(_a):
   detect [--json]                       installed harnesses, versions, auth, steering channel, local endpoints
   smoke HARNESS [-m M] [-e E]           one cheap headless call: exit code, event parsing, session id
   init SLUG -s 1..4 [-H h -m m -e e]    new run (+ PLAN.md template), becomes current
-  start NAME (--task-file F|--task T) [-H h -m m -e e] [--worktree] [--scope 'src/**,tests/**'] [--max-minutes N]
+  start NAME (--task-file F|--task T) [-H h -m m -e e] [--provider P] [--cwd DIR] [--max-minutes N]
+        --worktree                  own git worktree + branch (parallel / best-of-N)
+        --scope 'a/**,b.py'         allowed edit globs (edits outside -> SCOPE alert)
+        --protect 'tests/**'        read-only globs (Claude: hard-blocked by hook; others: alert)
+        --protect-existing-tests    every git-tracked test file read-only; new tests go in NEW files
+        --read-only                 reviewer mode: may run things, may not modify the project
+        --permission-mode M         override the harness's auto-approve mode
+  update NAME [--scope G] [--protect G] [--add-protect G] [--unprotect G]   live scope/protection change
   watch [--timeout S] [--workers a,b]   block until new activity/alerts/finish; prints condensed feed
   steer NAME "msg" [--mode hook|soft|hard]
   resume NAME "msg" | --message-file F  next round on the same session (feedback)
@@ -1645,6 +1672,8 @@ def main():
     add("resume", cmd_resume, (("name",), {}), (("message",), dict(nargs="?")), (("--message-file",), {}),
         (("--force",), dict(action="store_true")))
     add("stop", cmd_stop, (("name",), {}))
+    add("update", cmd_update, (("name",), {}), (("--scope",), {}), (("--protect",), {}),
+        (("--add-protect",), {}), (("--unprotect",), {}))
     add("status", cmd_status)
     add("log", cmd_log, (("name",), {}), (("--round",), dict(type=int)), (("--full",), dict(action="store_true")),
         (("--tail",), dict(type=int, default=80)), (("--stderr",), dict(action="store_true")))

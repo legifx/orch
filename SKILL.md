@@ -100,11 +100,14 @@ definition of done in that round.
    orch start <name> --task-file .orch/runs/<run>/tasks/<name>.md \
        [--scope 'src/feature/**,docs/**'] [--protect-existing-tests] [--worktree] --max-minutes <budget>
    ```
-   - Strictness ≥3: use `--protect-existing-tests`, and add a **plan gate** to the brief: "First
+   - Strictness ≥3: use `--protect-existing-tests` (every tracked test file becomes read-only, so the
+     brief must tell the worker to put **new tests in new files**), and add a **plan gate** to the brief: "First
      write your implementation plan into the worklog and finish with `ORCH_STATUS: PLAN_READY`."
      Review the plan, then `orch resume <name> "Plan approved …"` or send corrections. Strictness 4
      always uses the gate; strictness 3 uses it for anything bigger than a small fix.
    - Parallel and best-of-N need `--worktree` (their own branch per worker).
+   - To change scope or protection while a worker runs, use `orch update <name> --add-protect/--unprotect/--scope`.
+     Never edit `worker.json` by hand.
 
 ## Step 4 — Look over their shoulder
 
