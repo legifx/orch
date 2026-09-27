@@ -134,6 +134,7 @@ class Harness:
     system_prompt_flag = None  # harness can take the contract as system prompt
     stream = True              # emits a live JSON event stream (False: watch falls back to git diff pulses)
     stderr_sid = None          # regex to find the session id on stderr
+    reads_inbox = True         # follows the "re-read .orch/INBOX-<w>.md after each step" contract rule
     env = {}
 
     def binary(self):
@@ -617,6 +618,7 @@ class Hermes(Harness):
     auth_hint = "hermes status"
     stream = False                                    # prints the final answer only
     stderr_sid = re.compile(r"session_id:\s*(\S+)")
+    reads_inbox = False                               # observed: never re-reads the inbox file -> steer hard
 
     def build(self, w, prompt, resume):
         a = [self.binary(), "chat", "-Q", "--yolo"]
@@ -626,9 +628,16 @@ class Hermes(Harness):
             a += ["--provider", w["provider"]]
         if w.get("effort"):
             a += ["--reasoning", w["effort"]]
+        a += ["--in", w["cwd"]]                            # run (and resume) inside the worker's cwd/worktree
+        # Hermes prints its session id only when a turn ENDS, so a hard steer in round 1 had nothing to resume.
+        # A named session (-c NAME --create-if-missing) is resumable from the first second.
+        sess = f"orch-{w.get('run') or int(now())}-{w['name']}"
         if resume:
-            a += ["--resume", w["session_id"]]
+            sid = w.get("session_id")
+            a += ["--resume", sid] if sid and sid != sess else ["-c", sess]
         else:
+            a += ["-c", sess, "--create-if-missing"]
+            w["session_id"] = sess
             known = [n for n in w.get("skills") or [] if ".hermes" in str(find_skill(n, "hermes") or "")]
             if known:
                 a += ["-s", ",".join(known)]                # Hermes preloads the skills into the session
@@ -835,14 +844,32 @@ def alive(pid):
         return True
 
 
+def sid_from_stderr(w, h):
+    """Harnesses without an event stream (Hermes) print the session id on stderr; pick it up once."""
+    if not w.get("session_id") and h.stderr_sid:
+        errf = Path(w["dir"]) / f"stderr.r{w['round']}.log"
+        m = h.stderr_sid.search(errf.read_text(errors="replace")) if errf.exists() else None
+        if m:
+            w["session_id"] = m.group(1)
+    return w.get("session_id")
+
+
 def refresh(w):
     """Reconcile worker.json with process reality."""
     if w.get("status") == "running" and not alive(w.get("sup_pid")):
         ec = rjson(Path(w["dir"]) / f"exit.r{w['round']}.json", {})
-        w["status"] = "done" if ec.get("code") == 0 else ("stopped" if w.get("stop_requested") else "failed")
+        w["status"] = ("done" if ec.get("code") == 0 else "timeout" if ec.get("timeout")
+                       else "stopped" if w.get("stop_requested") else "failed")
         w["exit_code"] = ec.get("code")
         w["ended"] = ec.get("t") or now()
         save_worker(w)
+    if not w.get("session_id"):          # stderr-only harnesses (Hermes) print the id at exit; pick it up everywhere
+        h = harness(w["harness"])
+        errf = Path(w["dir"]) / f"stderr.r{w.get('round', 1)}.log"
+        m = h.stderr_sid.search(errf.read_text(errors="replace")) if h.stderr_sid and errf.exists() else None
+        if m:
+            w["session_id"] = m.group(1)
+            save_worker(w)
     return w
 
 
@@ -1084,7 +1111,7 @@ def build_contract(w, rd):
     run = rjson(rd / "run.json", {})
     s = run.get("strictness", 2)
     rep = {
-        "{{WORKER}}": w["name"], "{{WORKLOG}}": str(worklog_path(w)),
+        "{{WORKER}}": w["name"], "{{WORKLOG}}": str(worklog_path(w)), "{{CWD}}": str(w["cwd"]),
         "{{SCOPE}}": (", ".join(w.get("scope") or []) or "whatever the task requires (stay minimal)")
                      + (f". Read-only (protected): {', '.join(w['protect'])}" if w.get("protect") else ""),
         "{{COMMIT_RULE}}": ("Commit your work to the current branch with clear messages when a coherent step is done "
@@ -1094,6 +1121,8 @@ def build_contract(w, rd):
         "{{STEER}}": ("Messages tagged [ORCHESTRATOR] may appear in your context while you work. They come from your "
                       "supervisor: acknowledge them in one line and follow them immediately."
                       if harness(w["harness"]).steer == "hook" else
+                      "Your supervisor may interrupt and resume you with a message tagged [ORCHESTRATOR]; follow it immediately."
+                      if not harness(w["harness"]).reads_inbox else
                       f"Your supervisor may interrupt and resume you with a message tagged [ORCHESTRATOR]; "
                       f"follow it immediately. Also re-read {Path(w['cwd']) / '.orch' / ('INBOX-' + w['name'] + '.md')} "
                       "(if it exists) after each completed step and follow new entries."),
@@ -1146,6 +1175,8 @@ def cmd_supervise(a):
         save_worker(w)
         deadline = now() + 60 * float(w.get("max_minutes") or 120)
 
+        timed_out = []
+
         def on_term(*_):
             try:
                 p.send_signal(signal.SIGINT)
@@ -1156,12 +1187,14 @@ def cmd_supervise(a):
                     p.wait(5)
                 except subprocess.TimeoutExpired:
                     p.kill()
-            wjson(wd / f"exit.r{r}.json", dict(code=p.poll() if p.poll() is not None else -15, t=now(), stopped=True))
+            wjson(wd / f"exit.r{r}.json", dict(code=p.poll() if p.poll() is not None else -15, t=now(), stopped=True,
+                                                timeout=bool(timed_out)))
             sys.exit(0)
         signal.signal(signal.SIGTERM, on_term)
         while p.poll() is None:
             if now() > deadline:
                 err.write(f"\n[orch] max_minutes exceeded, stopping\n".encode())
+                timed_out.append(1)
                 on_term()
             time.sleep(1)
     wjson(wd / f"exit.r{r}.json", dict(code=p.returncode, t=now()))
@@ -1189,7 +1222,8 @@ def cmd_start(a):
             die("git worktree add failed:\n" + out)
     (cwd / ".orch").mkdir(parents=True, exist_ok=True)
     code, head = sh(["git", "rev-parse", "HEAD"], cwd=cwd)
-    w = dict(name=name, dir=str(wd), run=run["id"], cwd=str(cwd),
+    root_dirty = sh(["git", "status", "--porcelain"], cwd=root)[1].splitlines() if a.worktree else []
+    w = dict(name=name, dir=str(wd), run=run["id"], cwd=str(cwd), root=str(root), root_dirty_base=root_dirty,
              harness=a.harness or run.get("harness") or "claude",
              model=a.model if a.model is not None else run.get("model"),
              effort=a.effort if a.effort is not None else run.get("effort"),
@@ -1278,7 +1312,10 @@ def cmd_steer(a):
     stamp = f"[ORCHESTRATOR {hms()}] {msg}"
     if w["status"] != "running":
         die(f"{a.name} is {w['status']} - use `orch resume {a.name} \"...\"` to continue it", 3)
-    mode = a.mode or ("hook" if h.steer == "hook" else "soft")
+    mode = a.mode or ("hook" if h.steer == "hook" else "soft" if h.reads_inbox else "hard")
+    if mode == "soft" and not h.reads_inbox:
+        print(f"WARNING: {w['harness']} does not re-read its inbox file - this message will likely be ignored. "
+              "Use --mode hard (the default for this harness).")
     if mode == "hook":
         with open(Path(w["dir"]) / "inbox.md", "a") as f:
             f.write(stamp + "\n")
@@ -1289,7 +1326,7 @@ def cmd_steer(a):
             f.write(stamp + "\n")
         print(f"WROTE {ib} - {w['harness']} reads it after its next step. Use --mode hard if it must stop now.")
     else:  # hard: interrupt + resume
-        if not w.get("session_id"):
+        if not sid_from_stderr(w, h):
             die("no session id yet - wait for the first events or stop + restart the worker")
         stop_worker(w)
         spawn(w, stamp + "\n\nYou were interrupted by your supervisor. Apply the message above, then continue the task "
@@ -1419,11 +1456,7 @@ def cmd_watch(a):
                     if al:
                         alerts.setdefault(w["name"], []).extend(al)
             h = harness(w["harness"])
-            if not w.get("session_id") and h.stderr_sid:
-                errf = Path(w["dir"]) / f"stderr.r{w['round']}.log"
-                m = h.stderr_sid.search(errf.read_text(errors="replace")) if errf.exists() else None
-                if m:
-                    w["session_id"] = m.group(1)
+            sid_from_stderr(w, h)
             if not h.stream and w.get("base_commit"):
                 pulse = diff_pulse(w)
                 seen = st.setdefault("pulse", {})
@@ -1431,11 +1464,31 @@ def cmd_watch(a):
                 if changed:
                     st["last_event"] = now()
                     buf.setdefault(w["name"], []).extend(f"  r{w['round']} ✎ {f} (diff pulse)" for f in changed)
+                    scope = w.get("scope") or []
                     for f in changed:
-                        st.setdefault("edits", {})[f] = st["edits"].get(f, 0) + 1
+                        ed = st.setdefault("edits", {}); ed[f] = ed.get(f, 0) + 1
                         if f.startswith(".orch/WORKLOG"):
                             st["worklog_touch"] = now()
+                        elif prof["scope"] and scope and not any(fnmatch.fnmatch(f, g) for g in scope) \
+                                and f not in st.setdefault("scope_warned", []) and not f.startswith(".orch/"):
+                            st["scope_warned"].append(f)
+                            alerts.setdefault(w["name"], []).append(f"SCOPE - edit outside assigned scope: {f}")
                     seen.update(pulse)
+            if w.get("worktree") and w.get("root") and st.get("reported_round") != w["round"]:
+                # A worktree worker must never write into the main checkout (seen: a harness resets its shell
+                # cwd and a skill names the project path, so the worker edited the main repo instead).
+                base = set(w.get("root_dirty_base") or [])
+                code, out = sh(["git", "status", "--porcelain", "--untracked-files=no"], cwd=w["root"])
+                scope = w.get("scope") or []
+                for line in out.splitlines() if code == 0 else []:
+                    f = line[3:].strip()
+                    if line in base or f.startswith(".orch/") or f in st.setdefault("foreign_warned", []):
+                        continue
+                    if not scope or any(fnmatch.fnmatch(f, g) for g in scope):
+                        st["foreign_warned"].append(f)
+                        alerts.setdefault(w["name"], []).append(
+                            f"FOREIGN_WRITE - {f} changed in the MAIN checkout ({w['root']}), not in this worker's "
+                            f"worktree: stop it, move the change, resend its absolute cwd")
             if w["status"] == "running":
                 last = st.get("last_event") or w.get("started") or now()
                 if now() - last > prof["idle"] and not st.get("idle_warned"):
@@ -1593,7 +1646,8 @@ def cmd_smoke(a):
         p = subprocess.run(argv, cwd=tmp, capture_output=True, text=True, timeout=a.timeout, env=env,
                            stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
-        print(f"SMOKE FAIL {h.name}: timeout after {a.timeout}s")
+        print(f"SMOKE FAIL {h.name}: timeout after {a.timeout}s (slow provider? retry with --timeout 300, "
+              f"or pick another model/provider)")
         sys.exit(1)
     evs, sid = [], None
     for ln in p.stdout.splitlines():
@@ -1636,6 +1690,31 @@ def cmd_merge(a):
     sys.exit(code)
 
 
+def cmd_wait(a):
+    """Block until one (or --all) of the selected running workers is no longer running. Unlike `watch` it
+    does not wake on every diff pulse - use it for long quiet stretches (renders, big refactors)."""
+    root = project_root(a.dir)
+    rd = run_dir(root, a.run)
+    names = set(a.workers.split(",")) if a.workers else None
+    ws = [w for w in (refresh(load_worker(d)) for d in worker_dirs(rd)) if not names or w["name"] in names]
+    todo = {w["name"] for w in ws if w["status"] == "running"}
+    if not todo:
+        print("no running worker in the selection")
+        return
+    t0 = now()
+    while True:
+        cur = {w["name"]: w for w in (refresh(load_worker(d)) for d in worker_dirs(rd)) if w["name"] in todo}
+        fin = [n for n, w in cur.items() if w["status"] != "running"]
+        if (fin and not a.all) or len(fin) == len(todo) or (a.timeout and now() - t0 > a.timeout):
+            break
+        time.sleep(10)
+    for n in sorted(todo):
+        w = cur[n]
+        print(f"{n:14s} {w['status']:8s} r{w['round']}" + (f"  [{w['worker_status']}]" if w.get("worker_status") else ""))
+    if not fin:
+        print(f"timeout after {dur(now() - t0)}")
+
+
 def cmd_clean(a):
     root = project_root(a.dir)
     rd = run_dir(root, a.run)
@@ -1644,18 +1723,20 @@ def cmd_clean(a):
         if alive(w.get("sup_pid")):
             stop_worker(w)
         if w.get("worktree"):
+            for f in (Path(w["cwd"]) / ".orch").glob("*.md"):      # worklog + inbox live in the worktree
+                shutil.copy2(f, wdir / f.name)
             code, out = sh(["git", "worktree", "remove", "--force", w["cwd"]], cwd=root, timeout=60)
             print(f"worktree {w['cwd']}: {'removed' if code == 0 else out.strip()}")
             if a.branches and w.get("branch"):
                 sh(["git", "branch", "-D", w["branch"]], cwd=root)
-    print("clean done (run logs kept in " + str(rd) + ")")
+    print("clean done (run logs and worklogs kept in " + str(rd) + ")")
 
 
 def cmd_help(_a):
     print(__doc__)
     print("""commands:
   detect [--json]                       installed harnesses, versions, auth, steering channel, local endpoints
-  smoke HARNESS [-m M] [-e E]           one cheap headless call: exit code, event parsing, session id
+  smoke HARNESS [-m M] [-e E] [--provider P]  one cheap headless call: exit code, event parsing, session id
   init SLUG -s 1..4 [-H h -m m -e e]    new run (+ PLAN.md template), becomes current
   start NAME (--task-file F|--task T) [-H h -m m -e e] [--provider P] [--cwd DIR] [--max-minutes N]
         --worktree                  own git worktree + branch (parallel / best-of-N)
@@ -1666,6 +1747,7 @@ def cmd_help(_a):
         --permission-mode M         override the harness's auto-approve mode
   update NAME [--scope G] [--protect G] [--add-protect G] [--unprotect G]   live scope/protection change
   watch [--timeout S] [--workers a,b]   block until new activity/alerts/finish; prints condensed feed
+  wait [--workers a,b] [--all] [--timeout S]   block until a worker (or all) stops running; no activity wakeups
   steer NAME "msg" [--mode hook|soft|hard]
   resume NAME "msg" | --message-file F  next round on the same session (feedback)
   status | log NAME [--full --tail N] | diff NAME [--stat] | doc NAME
@@ -1711,6 +1793,7 @@ def main():
     add("diff", cmd_diff, (("name",), {}), (("--stat",), dict(action="store_true")))
     add("doc", cmd_doc, (("name",), {}), (("--max-chars",), dict(type=int, default=6000)))
     add("merge", cmd_merge, (("name",), {}))
+    add("wait", cmd_wait, (("--workers",), {}), (("--all",), dict(action="store_true")), (("--timeout",), dict(type=int)))
     add("clean", cmd_clean, (("--branches",), dict(action="store_true")))
     add("_supervise", cmd_supervise, (("wdir",), {}), (("round",), {}))
     add("_hook", cmd_hook, (("event",), {}), (("wdir",), {}))

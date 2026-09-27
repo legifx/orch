@@ -62,6 +62,13 @@ counter-example input), and the fix. If you find nothing, say which risky areas 
 
 Confirm every finding before using it: reproduce it, or read the code yourself. Drop what you can't confirm.
 
+What made reviewers effective in practice: give them the **interface contract** and the **timing/ID tables**
+from the plan, tell them which commands produce *evidence* (renders, debug dumps, measurement probes), and
+name the risk classes to hunt (state leaks between frames/requests, contract breaks at call sites, geometry or
+data that "looks fine" but is measurably off). With that, a reviewer found in each part several real
+defects the worker's own checks had missed (e.g. an object driving through the camera, feet sunk into the
+ground, a baked-in wrong screen image). For visual work, confirm each finding on the image before sending it.
+
 ## Cross-model reviewer (strictness 4)
 
 Same-family judges prefer their own family's output, so use a different model family from the worker:

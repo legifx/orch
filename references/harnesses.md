@@ -8,7 +8,7 @@ and haven't been run by the author.
 |---|---|---|---|---|---|
 | **Claude Code** ✅ | `claude -p --output-format stream-json --verbose --model M --effort E --permission-mode bypassPermissions --settings <hooks> --append-system-prompt <contract>` | yes | `--resume <id>` | **hook**: PreToolUse guard, PostToolUse inbox injection, Stop hook (inbox + worklog gate) | stdin `--input-format stream-json` (mid-turn injection + `control_request interrupt`, verified) |
 | **Antigravity** (`agy`) ✅ | `agy --output-format stream-json --dangerously-skip-permissions --model M --effort E -p <prompt>` | yes (`step_update`) | `--conversation <id>` | soft inbox / hard interrupt+resume | `--input-format stream-json` (one turn per message) |
-| **Hermes** ✅ | `hermes chat -Q --yolo -m M --provider P --reasoning E [-s skills] -q <prompt>` | final text only (diff pulse) | `--resume <id>` (id read from stderr) | soft / hard | `hermes acp` with `/steer <msg>` |
+| **Hermes** ✅ | `hermes chat -Q --yolo -m M --provider P --reasoning E --in <cwd> -c orch-<run>-<w> --create-if-missing [-s skills] -q <prompt>` | final text only (diff pulse) | `--resume <id>` (id read from stderr) | soft / hard | `hermes acp` with `/steer <msg>` |
 | **Command Code** ✅ | `command-code --trust --skip-onboarding --output-format json --yolo --tools-all -m M --effort E -p <prompt>` | yes (`event` envelope) | `--resume <id>` | soft / hard | – |
 | Codex CLI | `codex exec --json -m M -c model_reasoning_effort=E -s workspace-write [resume <id>] <prompt>` | yes (`thread/item/turn`) | `exec resume <thread_id>` | soft / hard | `codex app-server`: `turn/steer`, `turn/interrupt` |
 | Gemini CLI | `gemini -o stream-json -m M --approval-mode yolo -p <prompt>` | yes | `--resume <uuid>` | soft / hard | `--acp` (cancel + prompt) |
@@ -41,11 +41,32 @@ and haven't been run by the author.
 - **Codex** `workspace-write` blocks network by default. Tests that need the network fail; use
   `--permission-mode yolo` only inside a disposable sandbox or container.
 - **Gemini/Qwen** have no effort flag; set `thinkingConfig` in their settings.
-- **Hermes** `-z` doesn't print a session id, so `orch` uses `chat -Q`, which writes `session_id:` to stderr.
+- **Hermes** writes `session_id:` to stderr only **at the end of a turn**, so `orch` starts every worker in a
+  **named session** (`-c orch-<run>-<w> --create-if-missing`): `resume` and `steer --mode hard` work from
+  the first second, context included (verified: a worker interrupted mid-`sleep` knew afterwards that the
+  step had already run).
+- **Hermes ignores the INBOX file** (`steer --mode soft`), so `hard` is its default steer mode; an explicit
+  `soft` prints a warning. Each hard steer is a new round; that's fine.
+- **Hermes resets its shell cwd** (to `$HOME`) between terminal calls. `orch` passes `--in <cwd>` and the
+  worker contract makes `cd <cwd> &&` mandatory. Before that, workers whose skill named an example project
+  edited that project (the main checkout) instead of their worktree. `watch` now raises `FOREIGN_WRITE`
+  when an in-scope file changes in the main checkout while a worktree worker runs.
+- **Hermes** has a per-turn tool-call budget; a long turn can end in `ORCH_STATUS: BLOCKED` ("tool limit").
+  `resume` gives a fresh budget. Tell it to commit a WIP first so nothing is lost.
+- **Hermes** answers can be short (`max_tokens` in `~/.hermes/config.yaml`): ask for small patches, not
+  whole-file rewrites.
+- **Hermes** providers: `orch smoke hermes --provider P -m M` tests the exact route. Latency varies wildly by
+  provider (seen: a default route at 200–300 s per call with HTTP 524s, OpenRouter at 1–5 s); a smoke that
+  times out at 120 s is a red flag for the whole budget — check `agent.log` latencies and switch the
+  provider rather than waiting (`--timeout 300` only to confirm). A quota error
+  (`HTTP 429 … weekly usage limit`) or empty OpenRouter credits show up in the smoke output; per-call
+  token counts and latencies are in `~/.hermes/logs/agent.log`, totals per session in `~/.hermes/state.db`
+  (`sessions` table; `estimated_cost_usd` stays 0 for providers without a price table).
 - **agy** `-p` takes the prompt as its value; `orch` always puts it last.
 - **Goose** doesn't stream a session id; `orch` names the session `orch-<worker>-<ts>`.
 - Harnesses without live events (Hermes, Droid, Crush, Aider) are watched through **diff pulses**:
-  `watch` shows files that changed since the last poll.
+  `watch` shows files that changed since the last poll, and checks them against `--scope` (`SCOPE` alert).
+  Every pulse wakes `watch`; for long quiet stretches use `orch wait`.
 - Nested Claude: `orch` removes `CLAUDECODE` from the environment so that `claude -p` starts inside a
   Claude Code session.
 

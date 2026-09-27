@@ -89,10 +89,23 @@ definition of done in that round.
 4. **Write one brief per worker** to `.orch/runs/<run>/tasks/<worker>.md` (template:
    `references/brief.md`). Workers see nothing of your context, so a brief must stand alone: objective,
    context and relevant files, constraints, out-of-scope, **exact verification commands**, definition
-   of done. For parallel splits, file ownership must be disjoint.
-5. **Pipeline check**: `orch smoke <harness> -m <model> [-e <effort>]` once per distinct harness/model
-   (it checks the exit code, event parsing and session id). If it fails, fix it (auth, model id) or
-   ask the user before going on.
+   of done. For parallel splits, file ownership must be disjoint. If the parts share one runtime namespace
+   (modules `exec`'d together, one global scope), disjoint files are not enough: put an **interface
+   contract** in the repo before starting (registry/hook functions, exported names), require a
+   **per-worker prefix for top-level names**, and let each worker guard calls into parts that are still
+   empty in its worktree (`if "x" in globals()`). Shared docs (README) conflict on every merge: give each
+   worker its own section and resolve those conflicts yourself.
+   If the code isn't split along the seams you need yet, **cut the seam yourself before starting**: a
+   mechanical, behaviour-preserving move (e.g. all interior-scene code into `interior.py` behind 3–4
+   functions), proven identical (same test output, or pixel-identical renders), committed as the base. That is
+   integration work, not product code. Put shared constants (timings, IDs, units) into every brief as a
+   contract table. Tell each worker which **generated artefacts** its part needs in a fresh worktree
+   (pre-passes, builds) — otherwise it "fixes" the other worker's code to make its check pass.
+5. **Pipeline check**: `orch smoke <harness> -m <model> [-e <effort>] [--provider P]` once per distinct
+   harness/model/provider (it checks the exit code, event parsing and session id). If it fails, fix it
+   (auth, model id, quota) or ask the user before going on. Pass `--provider` whenever the worker will
+   get one, otherwise you test the harness default. Note the **latency** too: if one trivial call takes
+   > 30 s, budget for slow rounds (see *Slow workers* in `references/supervision.md`).
 6. Give the user a **5-line plan summary** (workers, models, definition of done, strictness), then
    start without waiting for approval, unless something is destructive or ambiguous.
 7. Start the workers:
@@ -118,7 +131,12 @@ Loop until every worker is finished and accepted:
 
 ```
 orch watch            # blocks until new activity, an alert or a finished worker (or the profile's interval)
+orch wait [--workers a,b] [--all] [--timeout S]   # blocks until a worker stops; no wake-ups on diff pulses
 ```
+
+With pulse-watched harnesses (Hermes …) `watch` wakes on every changed file. While a worker is in a long,
+known-good stretch, `orch wait` (in the background) is cheaper; run `watch` afterwards for the alerts.
+Glance at the worker's latest check images/logs in its worktree instead of interrupting it.
 
 `watch` prints the status table, a condensed feed (`$` shell, `✎` edits, `»` messages, `└ exit N`
 failures) and `!!` **alerts**. After each batch, decide on **one** step of the intervention ladder
@@ -129,7 +147,7 @@ failures) and `!!` **alerts**. After each batch, decide on **one** step of the i
 | 0 observe | on track | Nothing. At most one line in the progress ledger |
 | 1 nudge | small drift, a missed convention, STALE_DOC | `orch steer <w> "<one precise instruction>"` |
 | 2 correct | wrong approach, SCOPE, CHEAT?, TEST_EDIT with weakened asserts, LOOP, FAIL_STREAK | `steer` with the reason + the concrete alternative; `--mode hard` for non-hook harnesses |
-| 3 stop | DANGER, thrashing after a correction, heading for a dead end | `orch stop <w>`, fix the brief, then `resume` — or a fresh worker (`start <w>2`) when the context is poisoned |
+| 3 stop | DANGER, FOREIGN_WRITE, thrashing after a correction, heading for a dead end | `orch stop <w>`, fix the brief, then `resume` — or a fresh worker (`start <w>2`; names can't be reused, and a model/provider switch needs a fresh worker) when the context is poisoned |
 | 4 escalate | needs credentials, a product decision, or a destructive operation | Ask the user; keep other workers running |
 
 Steering messages are short, imperative and specific (≤3 sentences): *what* to change, *why*
@@ -169,13 +187,18 @@ Use the waiting time: turn your held-out checks into runnable scripts in the run
    Log it under *Review log* in `PLAN.md`.
 8. **Feedback**: write it from `templates/feedback.md`: blocking items first, each with evidence and the
    expected behaviour, plus approaches already rejected. Send it with
-   `orch resume <w> --message-file <file>` and go back to Step 4. Once the round limit is reached,
-   escalate to the user with options.
+   `orch resume <w> --message-file <file>` and go back to Step 4. **Recompute every number in your feedback**
+   (units, frame↔second, offsets) before sending: a wrong number from the judge costs a whole round, and a
+   good worker will (rightly) override it. Once the round limit is reached,
+   escalate to the user with options. A plan-gate round and a round cut off by `timeout` don't count as
+   feedback rounds; say so in the review log when you use that.
 
 ## Step 6 — Integrate and report
 
 1. Parallel or best-of-N: merge accepted workers **one at a time** (`orch merge <w>`) and re-run the full
-   suite after each merge. For best-of-N, merge only the winner.
+   suite after each merge. For best-of-N, merge only the winner. Each worker only ever ran its own part;
+   the first run of the *combined* code is where contract gaps show (name clashes, hooks overriding each
+   other). Budget time for one small fix worker after the merge.
 2. Run the full verification one last time on the integrated result.
 3. Write `.orch/runs/<run>/REPORT.md` and give the user a concise summary:
    - what was built, and where
@@ -183,7 +206,8 @@ Use the waiting time: turn your held-out checks into runnable scripts in the run
    - rounds, interventions, alerts that mattered, cost (`orch status`)
    - open issues and risks
    - where the docs and worklogs are
-4. Don't commit or push unless the user asked; offer to. Then `orch clean` (worktrees; logs are kept).
+4. Don't commit or push unless the user asked; offer to. Then `orch clean` (removes worktrees; run logs and
+   the workers' worklogs are copied to `.orch/runs/<run>/workers/<w>/` first).
 
 ## Reference files (read when needed, not up front)
 

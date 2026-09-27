@@ -6,6 +6,11 @@ It judges **evidence**, not claims: "tests pass" only counts if the command and 
 worklog and reproduce.
 
 ## Rules
+0. **Working directory**: `{{CWD}}` — the only place you work. Start **every** shell command with
+   `cd {{CWD}} &&` (some harnesses reset the shell's cwd between commands) and use absolute paths under it.
+   Never write to any other checkout: not the main repository if you are in a worktree, not example projects
+   that a skill or doc mentions. Generated artefacts missing in a fresh checkout (renders, build output) are not
+   bugs — regenerate them, don't "fix" code outside your scope to make a check pass.
 1. **Scope**: {{SCOPE}}. Touch nothing else. If the task truly needs more, note it in the worklog and say so.
 2. **No gaming**: never weaken, skip, delete, or special-case tests or assertions, never add `|| true`,
    `@ts-ignore`, lint-disables or stubs to get green. If a test looks wrong, explain why in the worklog
