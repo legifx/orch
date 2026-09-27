@@ -629,6 +629,9 @@ class Hermes(Harness):
         if resume:
             a += ["--resume", w["session_id"]]
         else:
+            known = [n for n in w.get("skills") or [] if ".hermes" in str(find_skill(n, "hermes") or "")]
+            if known:
+                a += ["-s", ",".join(known)]                # Hermes preloads the skills into the session
             prompt = w["contract"] + "\n\n---\n\n" + prompt
         return a + ["-q", prompt]
 
@@ -1051,6 +1054,31 @@ def cmd_init(a):
             print(f"WARN: working tree has {len(dirty.splitlines())} uncommitted change(s); commit or stash so worker diffs stay attributable.")
 
 
+SKILL_ROOTS = [Path.home() / ".claude" / "skills", Path.home() / ".hermes" / "skills", Path.home() / ".agents" / "skills"]
+
+
+def find_skill(name, harness_name=None):
+    """Locate a skill's SKILL.md: ~/.claude/skills/<n>, ~/.agents/skills/<n>, ~/.hermes/skills/<category>/<n>.
+    Hermes workers prefer the Hermes copy (it names Hermes tools); everyone else the others."""
+    roots = sorted(SKILL_ROOTS, key=lambda r: (r.parent.name == ".hermes") != (harness_name == "hermes"))
+    for root in roots:
+        for cand in (root / name / "SKILL.md", *root.glob(f"*/{name}/SKILL.md")):
+            if cand.is_file():
+                return cand
+    return None
+
+
+def skills_section(w):
+    lines = []
+    for n in w["skills"]:
+        p = find_skill(n, w["harness"])
+        how = ("preloaded into this session" if w["harness"] == "hermes" else
+               "invoke it with your Skill tool" if w["harness"] == "claude" else "read it before you start")
+        lines.append(f"- `{n}`: {how}" + (f" - {p} (follow it; its references/ and scripts sit next to it)" if p
+                                          else " - (not found on this machine; tell the orchestrator)"))
+    return "Use these skills - they contain the tested workflow, templates and pitfalls for this kind of work:\n" + "\n".join(lines) + "\n"
+
+
 def build_contract(w, rd):
     tpl = (SKILL_DIR / "templates" / "worker-contract.md").read_text()
     run = rjson(rd / "run.json", {})
@@ -1072,6 +1100,8 @@ def build_contract(w, rd):
     }
     for k, v in rep.items():
         tpl = tpl.replace(k, v)
+    if w.get("skills"):
+        tpl += "\n\n## Skills for this task\n" + skills_section(w)
     if w.get("read_only"):
         tpl += ("\n\n## You are a READ-ONLY REVIEWER\nDo not modify any project file. You may run read-only commands, "
                 "builds and tests. Write your findings to your worklog and final message, each with severity "
@@ -1168,6 +1198,7 @@ def cmd_start(a):
              scope=[g.strip() for g in (a.scope or "").split(",") if g.strip()],
              protect=[g.strip() for g in (a.protect or "").split(",") if g.strip()] + (["**"] if a.read_only else []),
              read_only=bool(a.read_only),
+             skills=[s_.strip() for s_ in (a.skills or run.get("skills") or "").split(",") if s_.strip()],
              worktree=bool(a.worktree), branch=branch,
              base_commit=head.strip() if code == 0 else None, round=0, cost_usd=0)
     if a.protect_existing_tests:
@@ -1665,7 +1696,7 @@ def main():
     add("start", cmd_start, (("name",), {}), (("--task-file",), {}), (("--task",), {}), *hm,
         (("--cwd",), {}), (("--worktree",), dict(action="store_true")), (("--scope",), {}), (("--protect",), {}),
         (("--protect-existing-tests",), dict(action="store_true")), (("--read-only",), dict(action="store_true")),
-        (("--permission-mode",), {}), (("--max-minutes",), dict(type=float, default=120)))
+        (("--permission-mode",), {}), (("--max-minutes",), dict(type=float, default=120)), (("--skills",), {}))
     add("watch", cmd_watch, (("--timeout",), dict(type=int)), (("--workers",), {}),
         (("--max-lines",), dict(type=int, default=40)))
     add("steer", cmd_steer, (("name",), {}), (("message",), {}), (("--mode",), dict(choices=["hook", "soft", "hard"])))

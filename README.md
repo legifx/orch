@@ -274,7 +274,7 @@ orch detect [--json]                         installed harnesses, versions, auth
 orch smoke HARNESS [-m M] [-e E]             one cheap headless call: exit, events, session id
 orch init SLUG -s 1..4 [-H h -m m -e e]      new run under .orch/ (git-excluded), PLAN.md template
 orch start NAME --task-file F [-H -m -e] [--worktree] [--scope GLOBS] [--protect GLOBS]
-           [--protect-existing-tests] [--read-only] [--max-minutes N]
+           [--protect-existing-tests] [--read-only] [--max-minutes N] [--skills a,b]
 orch watch [--timeout S] [--workers a,b]     block until activity / alert / finish → condensed feed
 orch steer NAME "msg" [--mode hook|soft|hard]
 orch resume NAME "msg" | --message-file F    next round on the same session (feedback)

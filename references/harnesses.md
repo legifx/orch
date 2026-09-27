@@ -8,7 +8,7 @@ and haven't been run by the author.
 |---|---|---|---|---|---|
 | **Claude Code** ✅ | `claude -p --output-format stream-json --verbose --model M --effort E --permission-mode bypassPermissions --settings <hooks> --append-system-prompt <contract>` | yes | `--resume <id>` | **hook**: PreToolUse guard, PostToolUse inbox injection, Stop hook (inbox + worklog gate) | stdin `--input-format stream-json` (mid-turn injection + `control_request interrupt`, verified) |
 | **Antigravity** (`agy`) ✅ | `agy --output-format stream-json --dangerously-skip-permissions --model M --effort E -p <prompt>` | yes (`step_update`) | `--conversation <id>` | soft inbox / hard interrupt+resume | `--input-format stream-json` (one turn per message) |
-| **Hermes** ✅ | `hermes chat -Q --yolo -m M --provider P --reasoning E -q <prompt>` | final text only (diff pulse) | `--resume <id>` (id read from stderr) | soft / hard | `hermes acp` with `/steer <msg>` |
+| **Hermes** ✅ | `hermes chat -Q --yolo -m M --provider P --reasoning E [-s skills] -q <prompt>` | final text only (diff pulse) | `--resume <id>` (id read from stderr) | soft / hard | `hermes acp` with `/steer <msg>` |
 | **Command Code** ✅ | `command-code --trust --skip-onboarding --output-format json --yolo --tools-all -m M --effort E -p <prompt>` | yes (`event` envelope) | `--resume <id>` | soft / hard | – |
 | Codex CLI | `codex exec --json -m M -c model_reasoning_effort=E -s workspace-write [resume <id>] <prompt>` | yes (`thread/item/turn`) | `exec resume <thread_id>` | soft / hard | `codex app-server`: `turn/steer`, `turn/interrupt` |
 | Gemini CLI | `gemini -o stream-json -m M --approval-mode yolo -p <prompt>` | yes | `--resume <uuid>` | soft / hard | `--acp` (cancel + prompt) |

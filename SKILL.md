@@ -98,7 +98,7 @@ definition of done in that round.
 7. Start the workers:
    ```
    orch start <name> --task-file .orch/runs/<run>/tasks/<name>.md \
-       [--scope 'src/feature/**,docs/**'] [--protect-existing-tests] [--worktree] --max-minutes <budget>
+       [--scope 'src/feature/**,docs/**'] [--protect-existing-tests] [--worktree] [--skills a,b] --max-minutes <budget>
    ```
    - Strictness ≥3: use `--protect-existing-tests` (every tracked test file becomes read-only, so the
      brief must tell the worker to put **new tests in new files**), and add a **plan gate** to the brief: "First
@@ -106,6 +106,9 @@ definition of done in that round.
      Review the plan, then `orch resume <name> "Plan approved …"` or send corrections. Strictness 4
      always uses the gate; strictness 3 uses it for anything bigger than a small fix.
    - Parallel and best-of-N need `--worktree` (their own branch per worker).
+   - If a skill covers the task (e.g. `blender-spot` for videos rendered in Blender), pass `--skills <name>[,<name>]`.
+     Hermes preloads them (`-s`). Every other harness gets a "Skills for this task" section in its contract
+     with the resolved SKILL.md path (`~/.claude/skills`, `~/.agents/skills`, `~/.hermes/skills/<category>`).
    - To change scope or protection while a worker runs, use `orch update <name> --add-protect/--unprotect/--scope`.
      Never edit `worker.json` by hand.
 
