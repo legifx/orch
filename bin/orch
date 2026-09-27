@@ -1,0 +1,1665 @@
+#!/usr/bin/env python3
+"""orch - drive headless coding-agent harnesses for the /orch Claude Code skill.
+
+Stdlib only. All state lives in <project>/.orch/ (git-excluded):
+
+  .orch/current                        id of the active run
+  .orch/runs/<run>/run.json            settings (strictness, defaults, goal)
+  .orch/runs/<run>/PLAN.md             orchestrator plan + acceptance criteria
+  .orch/runs/<run>/workers/<w>/        worker.json, prompt.rN.md, events.rN.jsonl,
+                                       stderr.rN.log, inbox.md, watch.json
+  <worker cwd>/.orch/WORKLOG-<w>.md    the worker's running documentation
+
+Run `orch help` for the command list.
+"""
+import argparse
+import concurrent.futures
+import fnmatch
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+SKILL_DIR = HERE.parent
+ORCH_BIN = str(Path(__file__).resolve())
+
+# --------------------------------------------------------------------------
+# strictness profiles (1..4) - the single source of truth for thresholds
+# --------------------------------------------------------------------------
+STRICTNESS = {
+    1: dict(name="draft", watch=180, fail_streak=5, loop=4, idle=600, stale_doc=None,
+            scope=False, cheat=False, rounds=1, enforce_worklog=False),
+    2: dict(name="standard", watch=120, fail_streak=4, loop=3, idle=420, stale_doc=900,
+            scope=True, cheat=True, rounds=2, enforce_worklog=True),
+    3: dict(name="strict", watch=75, fail_streak=3, loop=3, idle=300, stale_doc=600,
+            scope=True, cheat=True, rounds=3, enforce_worklog=True),
+    4: dict(name="paranoid", watch=45, fail_streak=2, loop=2, idle=240, stale_doc=420,
+            scope=True, cheat=True, rounds=5, enforce_worklog=True),
+}
+
+DANGER = re.compile(
+    r"rm\s+-[a-z]*r[a-z]*f?\s+(/|~|\$HOME|\.\.?(\s|$))|git\s+push|git\s+reset\s+--hard|"
+    r"git\s+clean\s+-[a-z]*f|git\s+checkout\s+--\s+\.|--force\b|--no-verify|push\s+-f\b|"
+    r"\bsudo\b|chmod\s+-R\s+777|curl[^|]*\|\s*(ba)?sh|wget[^|]*\|\s*(ba)?sh|"
+    r"DROP\s+(TABLE|DATABASE)|mkfs|dd\s+if=|>\s*/dev/sd|npm\s+publish|twine\s+upload|"
+    r"gh\s+(pr\s+merge|release|repo\s+delete)", re.I)
+CHEAT = re.compile(
+    r"\.skip\(|\bxit\(|\bxdescribe\(|@pytest\.mark\.skip|@unittest\.skip|pytest\.skip\(|"
+    r"assert\s+True\b|expect\(true\)\.toBe\(true\)|\|\|\s*true\b|# *type: *ignore|"
+    r"@ts-ignore|@ts-nocheck|eslint-disable|# *noqa|#\[allow\(|t\.Skip\(|"
+    r"it\.todo\(|test\.todo\(|\bTODO: *implement|NotImplementedError|"
+    r"return\s+(True|true|0)\s*#\s*(stub|fake|hack)", re.I)
+JUNK = re.compile(r"(^|/)(__pycache__|node_modules|\.pytest_cache|\.mypy_cache|\.ruff_cache|\.venv|venv|"
+                  r"dist|build|target|coverage|\.next|\.turbo)/|\.(pyc|pyo|log|tmp)$|\.DS_Store$")
+INSPECT = re.compile(r"^\s*(git\s+(status|diff|log|show|branch)|ls|pwd|cat|head|tail|wc|echo|which|tree)\b")
+TESTY = re.compile(r"(^|/)(tests?|__tests__|spec)(/|$)|[._-](test|spec)\.[a-z]+$|_test\.go$|test_[^/]*\.py$")
+EDIT_TOOLS = {"edit", "write", "multiedit", "notebookedit", "str_replace", "create_file",
+              "apply_patch", "replace", "write_file", "edit_file", "patch", "write_to_file",
+              "replace_file_content", "multi_replace_file_content"}
+READ_TOOLS = {"read", "read_file", "view", "cat", "view_file", "list_dir", "ls", "grep", "glob", "grep_search",
+              "find_by_name", "codebase_search", "view_code_item", "search", "list_files", "search_files", "todowrite",
+              "todoread", "read_many_files", "list_directory", "search_file_content"}
+SHELL_TOOLS = {"bash", "shell", "run_shell_command", "shell_command", "run_command", "exec_command", "terminal", "command"}
+
+
+def now():
+    return time.time()
+
+
+def hms(t=None):
+    return time.strftime("%H:%M:%S", time.localtime(t or now()))
+
+
+def dur(sec):
+    sec = int(max(0, sec))
+    if sec < 60:
+        return f"{sec}s"
+    if sec < 3600:
+        return f"{sec // 60}m{sec % 60:02d}s"
+    return f"{sec // 3600}h{(sec % 3600) // 60:02d}m"
+
+
+def clip(s, n=160):
+    s = " ".join(str(s).split())
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def rjson(p, default=None):
+    try:
+        return json.loads(Path(p).read_text())
+    except Exception:
+        return default
+
+
+def wjson(p, obj):
+    p = Path(p)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=2, ensure_ascii=False))
+    os.replace(tmp, p)
+
+
+def die(msg, code=2):
+    print(f"orch: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def sh(cmd, cwd=None, timeout=20):
+    try:
+        r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout,
+                           shell=isinstance(cmd, str))
+        return r.returncode, (r.stdout or "") + (r.stderr or "")
+    except Exception as e:  # noqa: BLE001 - report any launch failure
+        return 127, str(e)
+
+
+# --------------------------------------------------------------------------
+# harness adapters
+# --------------------------------------------------------------------------
+class Harness:
+    """One CLI coding agent. Subclasses fill in argv building and event parsing."""
+    name = ""
+    bins = ()
+    label = ""
+    steer = "restart"          # hook | restart
+    effort_levels = ()
+    models_hint = ""
+    auth_hint = ""
+    system_prompt_flag = None  # harness can take the contract as system prompt
+    stream = True              # emits a live JSON event stream (False: watch falls back to git diff pulses)
+    stderr_sid = None          # regex to find the session id on stderr
+    env = {}
+
+    def binary(self):
+        for b in self.bins:
+            p = shutil.which(b)
+            if p:
+                return p
+        return None
+
+    def version(self, path):
+        code, out = sh([path, "--version"], timeout=8)
+        line = next((ln for ln in out.splitlines() if ln.strip()), "")
+        return clip(line, 60) if code == 0 else "?"
+
+    def auth(self):
+        return None  # None = unknown, True/False when checkable cheaply
+
+    def build(self, w, prompt, resume):
+        raise NotImplementedError
+
+    def parse(self, obj):
+        """Map one JSON event to a list of normalized events (dicts)."""
+        return generic_parse(obj)
+
+
+def _content_text(c):
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        return " ".join(_content_text(x.get("text", x.get("content", ""))) if isinstance(x, dict) else str(x) for x in c)
+    if isinstance(c, dict):
+        return _content_text(c.get("text") or c.get("content") or "")
+    return str(c or "")
+
+
+def tool_event(name, inp, tid=None):
+    """Normalize a tool call. Returns kind shell|edit|read|tool."""
+    n = (name or "").lower()
+    inp = inp if isinstance(inp, dict) else {"input": inp}
+    path = (inp.get("file_path") or inp.get("path") or inp.get("filePath") or inp.get("notebook_path")
+            or inp.get("TargetFile") or inp.get("AbsolutePath"))
+    if "CommandLine" in inp:
+        inp = dict(inp, command=inp["CommandLine"])
+    if n in SHELL_TOOLS or "command" in inp and isinstance(inp.get("command"), (str, list)) and n not in EDIT_TOOLS:
+        cmd = inp.get("command") or inp.get("cmd")
+        if isinstance(cmd, list):
+            cmd = " ".join(map(str, cmd))
+        return dict(k="shell", cmd=str(cmd), id=tid)
+    if n in EDIT_TOOLS or n.endswith("edit") or n.endswith("write"):
+        body = " ".join(str(inp.get(x, "")) for x in ("new_string", "content", "new_str", "patch", "input", "edits",
+                                                      "CodeContent", "ReplacementContent", "ReplacementChunks"))
+        return dict(k="edit", path=str(path or "?"), body=body[:20000], id=tid)
+    if n in READ_TOOLS:
+        return dict(k="read", path=str(path or "?"), id=tid)
+    return dict(k="tool", name=name, arg=clip(json.dumps(inp, ensure_ascii=False), 120), id=tid)
+
+
+def generic_parse(o):
+    """Best effort for unknown JSON event shapes."""
+    if not isinstance(o, dict):
+        return [dict(k="say", text=str(o))]
+    out = []
+    sid = (o.get("session_id") or o.get("sessionId") or o.get("sessionID") or o.get("thread_id")
+           or o.get("conversation_id") or o.get("conversationId"))
+    if sid:
+        out.append(dict(k="init", sid=sid))
+    t = (o.get("type") or o.get("event") or "").lower()
+    if "error" in t:
+        out.append(dict(k="error", text=clip(json.dumps(o), 300)))
+    elif t in {"result", "done", "complete", "completed", "turn.completed", "finish"}:
+        out.append(dict(k="done", ok=not o.get("is_error"), text=_content_text(o.get("result", ""))))
+    elif "tool" in t:
+        out.append(tool_event(o.get("name") or o.get("tool_name") or o.get("tool"),
+                              o.get("input") or o.get("parameters") or o.get("args") or {}))
+    else:
+        txt = _content_text(o.get("text") or o.get("content") or o.get("message") or "")
+        if txt.strip():
+            out.append(dict(k="say", text=txt))
+    return out
+
+
+class Claude(Harness):
+    name, bins, label = "claude", ("claude",), "Claude Code"
+    steer = "hook"
+    effort_levels = ("low", "medium", "high", "xhigh", "max")
+    models_hint = "aliases: fable, opus, sonnet, haiku (or a full model id)"
+    auth_hint = "claude auth status / ANTHROPIC_API_KEY"
+    system_prompt_flag = "--append-system-prompt"
+
+    def auth(self):
+        if os.environ.get("ANTHROPIC_API_KEY"):
+            return True
+        code, out = sh(["claude", "auth", "status"], timeout=8)
+        if code == 0:
+            return "not logged in" not in out.lower() and '"loggedIn": false' not in out
+        return None
+
+    def build(self, w, prompt, resume):
+        a = [self.binary(), "-p", "--output-format", "stream-json", "--verbose"]
+        if w.get("model"):
+            a += ["--model", w["model"]]
+        if w.get("effort"):
+            a += ["--effort", w["effort"]]
+        a += ["--permission-mode", w.get("permission_mode") or "bypassPermissions"]
+        hook = shlex.quote(ORCH_BIN)
+        wd = shlex.quote(w["dir"])
+        settings = {"hooks": {
+            "PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": f"{hook} _hook pre {wd}"}]}],
+            "PostToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": f"{hook} _hook post {wd}"}]}],
+            "Stop": [{"hooks": [{"type": "command", "command": f"{hook} _hook stop {wd}"}]}],
+        }}
+        a += ["--settings", json.dumps(settings)]
+        if resume:
+            a += ["--resume", w["session_id"]]
+        else:
+            a += [self.system_prompt_flag, w["contract"]]
+        a += [prompt]
+        return a
+
+    def parse(self, o):
+        t = o.get("type")
+        if t == "system" and o.get("subtype") == "init":
+            return [dict(k="init", sid=o.get("session_id"), model=o.get("model"))]
+        if t == "assistant":
+            out = []
+            for c in (o.get("message") or {}).get("content") or []:
+                ct = c.get("type")
+                if ct == "text" and c.get("text", "").strip():
+                    out.append(dict(k="say", text=c["text"]))
+                elif ct == "thinking" and c.get("thinking", "").strip():
+                    out.append(dict(k="think", text=c["thinking"]))
+                elif ct == "tool_use":
+                    out.append(tool_event(c.get("name"), c.get("input"), c.get("id")))
+            return out
+        if t == "user":
+            out = []
+            content = (o.get("message") or {}).get("content")
+            for c in content if isinstance(content, list) else []:
+                if isinstance(c, dict) and c.get("type") == "tool_result":
+                    txt = _content_text(c.get("content"))
+                    m = re.search(r"[Ee]xit code (\d+)", txt)
+                    code = int(m.group(1)) if m else (1 if c.get("is_error") else 0)
+                    out.append(dict(k="result", id=c.get("tool_use_id"), exit=code, text=txt))
+            return out
+        if t == "result":
+            return [dict(k="done", ok=not o.get("is_error"), sid=o.get("session_id"),
+                         cost=o.get("total_cost_usd"), turns=o.get("num_turns"),
+                         text=o.get("result") or o.get("subtype", ""))]
+        return []
+
+
+class Codex(Harness):
+    name, bins, label = "codex", ("codex",), "OpenAI Codex CLI"
+    effort_levels = ("minimal", "low", "medium", "high", "xhigh")
+    models_hint = "e.g. gpt-5.5-codex, gpt-5.5 (`codex debug models`); -c model_provider=oss for local"
+    auth_hint = "codex login status / OPENAI_API_KEY"
+
+    def auth(self):
+        if os.environ.get("OPENAI_API_KEY") or os.environ.get("CODEX_API_KEY"):
+            return True
+        code, _ = sh(["codex", "login", "status"], timeout=8)
+        return code == 0
+
+    def build(self, w, prompt, resume):
+        a = [self.binary(), "exec", "--json", "--skip-git-repo-check"]
+        if w.get("model"):
+            a += ["-m", w["model"]]
+        if w.get("effort"):
+            a += ["-c", f"model_reasoning_effort={w['effort']}"]
+        if w.get("provider"):
+            a += ["-c", f"model_provider={w['provider']}"]
+        if w.get("read_only"):
+            a += ["-s", "read-only"]
+        elif (w.get("permission_mode") or "") == "yolo":
+            a += ["--dangerously-bypass-approvals-and-sandbox"]
+        else:
+            a += ["-s", "workspace-write"]
+        if resume:
+            a += ["resume", w["session_id"]]
+        else:
+            prompt = w["contract"] + "\n\n---\n\n" + prompt
+        return a + [prompt]
+
+    def parse(self, o):
+        t = o.get("type") or ""
+        if t == "thread.started":
+            return [dict(k="init", sid=o.get("thread_id"))]
+        if t in ("item.started", "item.completed"):
+            it = o.get("item") or {}
+            ty = it.get("type") or it.get("item_type")
+            if ty == "command_execution":
+                if t == "item.started":
+                    return [dict(k="shell", cmd=it.get("command", ""), id=it.get("id"))]
+                return [dict(k="result", id=it.get("id"), exit=it.get("exit_code") or 0,
+                             text=it.get("aggregated_output", ""))]
+            if t != "item.completed":
+                return []
+            if ty in ("agent_message", "assistant_message"):
+                return [dict(k="say", text=it.get("text", ""))]
+            if ty == "reasoning":
+                return [dict(k="think", text=it.get("text", ""))]
+            if ty == "file_change":
+                return [dict(k="edit", path=c.get("path", "?"), body="") for c in it.get("changes") or []]
+            if ty in ("mcp_tool_call", "web_search", "todo_list"):
+                return [dict(k="tool", name=ty, arg=clip(json.dumps(it, ensure_ascii=False), 120))]
+            if ty == "error":
+                return [dict(k="error", text=it.get("message", ""))]
+            return []
+        if t == "turn.completed":
+            return [dict(k="done", ok=True, usage=o.get("usage"), text="")]
+        if t in ("turn.failed", "error"):
+            err = o.get("error") or {}
+            msg = err.get("message") if isinstance(err, dict) else o.get("message")
+            out = [dict(k="error", text=msg or json.dumps(o))]
+            return out + ([dict(k="done", ok=False, text=msg or "")] if t == "turn.failed" else [])
+        return []
+
+
+class Gemini(Harness):
+    name, bins, label = "gemini", ("gemini",), "Google Gemini CLI"
+    models_hint = "e.g. gemini-3.1-pro, gemini-3.8-flash (-m); effort only via settings.json thinkingConfig"
+    auth_hint = "GEMINI_API_KEY or Google login (~/.gemini)"
+
+    def auth(self):
+        return bool(os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+                    or (Path.home() / ".gemini" / "oauth_creds.json").exists()) or None
+
+    def build(self, w, prompt, resume):
+        a = [self.binary(), "-o", "stream-json"]
+        if w.get("model"):
+            a += ["-m", w["model"]]
+        a += ["--approval-mode", "plan" if w.get("read_only") else (w.get("permission_mode") or "yolo")]
+        if resume:
+            a += ["--resume", w["session_id"]]
+        else:
+            prompt = w["contract"] + "\n\n---\n\n" + prompt
+        return a + ["-p", prompt]
+
+    def parse(self, o):
+        t = o.get("type")
+        if t == "init":
+            return [dict(k="init", sid=o.get("session_id"), model=o.get("model"))]
+        if t == "message" and o.get("role") == "assistant":
+            return [dict(k="say", text=o.get("content", ""))]
+        if t == "tool_use":
+            return [tool_event(o.get("tool_name"), o.get("parameters") or {}, o.get("tool_id"))]
+        if t == "tool_result":
+            ok = (o.get("status") or "success") == "success"
+            return [dict(k="result", id=o.get("tool_id"), exit=0 if ok else 1, text=_content_text(o.get("output", "")))]
+        if t == "error":
+            return [dict(k="error", text=o.get("message", json.dumps(o)))]
+        if t == "result":
+            return [dict(k="done", ok=(o.get("status") or "success") == "success", text="", usage=o.get("stats"))]
+        return []
+
+
+class Qwen(Harness):
+    name, bins, label = "qwen", ("qwen",), "Qwen Code"
+    models_hint = "--model + --auth-type openai|anthropic|gemini (or ~/.qwen settings)"
+    auth_hint = "qwen auth status / OPENAI_API_KEY+OPENAI_BASE_URL"
+
+    def build(self, w, prompt, resume):
+        a = [self.binary(), "--output-format", "stream-json",
+             "--approval-mode", "plan" if w.get("read_only") else (w.get("permission_mode") or "yolo")]
+        if w.get("model"):
+            a += ["--model", w["model"]]
+        if w.get("provider"):
+            a += ["--auth-type", w["provider"]]
+        if resume:
+            a += ["--resume", w["session_id"]]
+        else:
+            prompt = w["contract"] + "\n\n---\n\n" + prompt
+        return a + ["-p", prompt]
+
+    parse = Claude.parse  # Claude-style stream-json (system/init, assistant, user, result)
+
+
+class OpenCode(Harness):
+    name, bins, label = "opencode", ("opencode",), "opencode"
+    models_hint = "provider/model, e.g. anthropic/claude-sonnet-5 (`opencode models`); effort = --variant"
+    auth_hint = "opencode auth list"
+
+    def build(self, w, prompt, resume):
+        a = [self.binary(), "run", "--format", "json"]
+        if not w.get("read_only"):
+            a += ["--auto"]
+        if w.get("model"):
+            a += ["-m", w["model"]]
+        if w.get("effort"):
+            a += ["--variant", w["effort"]]
+        if resume:
+            a += ["-s", w["session_id"]]
+        else:
+            prompt = w["contract"] + "\n\n---\n\n" + prompt
+        return a + [prompt]
+
+    def parse(self, o):
+        t = o.get("type")
+        part = o.get("part") or {}
+        sid = o.get("sessionID") or part.get("sessionID")
+        out = [dict(k="init", sid=sid)] if sid else []
+        if t == "text":
+            out.append(dict(k="say", text=part.get("text", "")))
+        elif t == "tool_use":
+            st = part.get("state") or {}
+            out.append(tool_event(part.get("tool"), st.get("input") or {}, part.get("callID")))
+            if st.get("status") in ("completed", "error"):
+                meta = st.get("metadata") or {}
+                code = meta.get("exit", 1 if st.get("status") == "error" else 0)
+                out.append(dict(k="result", id=part.get("callID"), exit=code or 0, text=str(st.get("output", ""))))
+        elif t == "error":
+            out.append(dict(k="error", text=json.dumps(o.get("error") or o)))
+        elif t == "step_finish" and part.get("reason") == "stop":
+            out.append(dict(k="done", ok=True, cost=part.get("cost"), text=""))
+        return out
+
+
+class CursorAgent(Harness):
+    name, bins, label = "cursor", ("cursor-agent", "agent"), "Cursor CLI"
+    models_hint = "`agent models` (e.g. gpt-5.5, sonnet-5, composer-2)"
+    auth_hint = "agent status / CURSOR_API_KEY"
+
+    def binary(self):
+        if shutil.which("cursor-agent"):
+            return shutil.which("cursor-agent")
+        p = shutil.which("agent")  # generic name: only accept Cursor's
+        if p and "cursor" in sh([p, "--help"], timeout=5)[1].lower():
+            return p
+        return None
+
+    def build(self, w, prompt, resume):
+        a = [self.binary(), "-p", "--output-format", "stream-json", "--trust"]
+        if not w.get("read_only"):
+            a += ["--force"]
+        if w.get("model"):
+            a += ["--model", w["model"]]
+        if resume:
+            a += ["--resume", w["session_id"]]
+        else:
+            prompt = w["contract"] + "\n\n---\n\n" + prompt
+        return a + [prompt]
+
+    def parse(self, o):
+        if o.get("type") == "tool_call":
+            tc = o.get("tool_call") or {}
+            key = next(iter(tc), "")
+            args = (tc.get(key) or {}).get("args") or {}
+            if o.get("subtype") == "started":
+                n = key.replace("ToolCall", "").lower()
+                return [tool_event("bash" if n in ("shell", "terminal") else n, args, o.get("call_id"))]
+            res = (tc.get(key) or {}).get("result") or {}
+            failed = "error" in json.dumps(res)[:200].lower() or bool((res.get("success") or {}).get("exitCode"))
+            return [dict(k="result", id=o.get("call_id"), exit=1 if failed else 0, text=clip(json.dumps(res), 300))]
+        return Claude.parse(self, o)
+
+
+class Amp(Harness):
+    name, bins, label = "amp", ("amp",), "Amp"
+    effort_levels = ("low", "medium", "high", "ultra")  # amp "mode"
+    models_hint = "no model flag: effort selects the mode (-m low|medium|high|ultra)"
+    auth_hint = "AMP_API_KEY or amp login"
+
+    def build(self, w, prompt, resume):
+        a = [self.binary()]
+        if resume:
+            a += ["threads", "continue", w["session_id"]]
+        a += ["--stream-json", "--dangerously-allow-all"]
+        if w.get("effort"):
+            a += ["-m", w["effort"]]
+        if not resume:
+            prompt = w["contract"] + "\n\n---\n\n" + prompt
+        return a + ["-x", prompt]
+
+    parse = Claude.parse
+
+
+class Droid(Harness):
+    name, bins, label = "droid", ("droid",), "Factory Droid"
+    effort_levels = ("low", "medium", "high")
+    models_hint = "-m MODEL_ID (droid exec --help)"
+    auth_hint = "FACTORY_API_KEY"
+    stream = False
+
+    def build(self, w, prompt, resume):
+        a = [self.binary(), "exec", "-o", "json", "--auto", "low" if w.get("read_only") else "high"]
+        if w.get("model"):
+            a += ["-m", w["model"]]
+        if w.get("effort"):
+            a += ["-r", w["effort"]]
+        if resume:
+            a += ["-s", w["session_id"]]
+        else:
+            prompt = w["contract"] + "\n\n---\n\n" + prompt
+        return a + [prompt]
+
+
+class Copilot(Harness):
+    name, bins, label = "copilot", ("copilot",), "GitHub Copilot CLI"
+    effort_levels = ("low", "medium", "high", "xhigh", "max")
+    models_hint = "--model <id|auto>"
+    auth_hint = "COPILOT_GITHUB_TOKEN / GH_TOKEN / copilot login"
+
+    def build(self, w, prompt, resume):
+        a = [self.binary(), "-s", "--output-format", "json", "--no-ask-user"]
+        if not w.get("read_only"):
+            a += ["--allow-all"]
+        if w.get("model"):
+            a += ["--model", w["model"]]
+        if w.get("effort"):
+            a += ["--effort", w["effort"]]
+        if resume:
+            a += [f"--resume={w['session_id']}"]
+        else:
+            prompt = w["contract"] + "\n\n---\n\n" + prompt
+        return a + ["-p", prompt]
+
+
+class Goose(Harness):
+    name, bins, label = "goose", ("goose",), "Goose"
+    models_hint = "--provider X --model Y"
+    auth_hint = "goose info --check"
+    env = {"GOOSE_MODE": "auto"}
+
+    def build(self, w, prompt, resume):
+        w.setdefault("session_id", f"orch-{w['name']}-{int(now())}")  # goose names sessions; id is not streamed
+        a = [self.binary(), "run", "--output-format", "stream-json", "-n", w["session_id"]]
+        if w.get("provider"):
+            a += ["--provider", w["provider"]]
+        if w.get("model"):
+            a += ["--model", w["model"]]
+        if resume:
+            a += ["--resume"]
+        else:
+            prompt = w["contract"] + "\n\n---\n\n" + prompt
+        return a + ["-t", prompt]
+
+
+class Crush(Harness):
+    name, bins, label = "crush", ("crush",), "Crush (Charm)"
+    models_hint = "provider/model (`crush models`)"
+    stream = False
+
+    def build(self, w, prompt, resume):
+        a = [self.binary(), "run", "-y"]
+        if w.get("model"):
+            a += ["-m", w["model"]]
+        if w.get("effort"):
+            a += ["--reasoning-effort", w["effort"]]
+        if not resume:
+            prompt = w["contract"] + "\n\n---\n\n" + prompt
+        elif w.get("session_id"):
+            a += ["-s", w["session_id"]]
+        return a + [prompt]
+
+
+class Kiro(Harness):
+    name, bins, label = "kiro", ("kiro-cli",), "Kiro CLI"
+    effort_levels = ("low", "medium", "high")
+    models_hint = "`kiro-cli chat --list-models`"
+    auth_hint = "kiro-cli whoami"
+
+    def build(self, w, prompt, resume):
+        a = [self.binary(), "chat", "--no-interactive", "--output-format", "stream-json"]
+        if not w.get("read_only"):
+            a += ["--trust-all-tools"]
+        if w.get("model"):
+            a += ["--model", w["model"]]
+        if w.get("effort"):
+            a += ["--effort", w["effort"]]
+        if resume:
+            a += ["--resume-id", w["session_id"]]
+        else:
+            prompt = w["contract"] + "\n\n---\n\n" + prompt
+        return a + [prompt]
+
+
+class Hermes(Harness):
+    name, bins, label = "hermes", ("hermes",), "Hermes Agent (Nous)"
+    effort_levels = ("none", "minimal", "low", "medium", "high", "xhigh")
+    models_hint = "-m provider/model, --provider X (`hermes model`)"
+    auth_hint = "hermes status"
+    stream = False                                    # prints the final answer only
+    stderr_sid = re.compile(r"session_id:\s*(\S+)")
+
+    def build(self, w, prompt, resume):
+        a = [self.binary(), "chat", "-Q", "--yolo"]
+        if w.get("model"):
+            a += ["-m", w["model"]]
+        if w.get("provider"):
+            a += ["--provider", w["provider"]]
+        if w.get("effort"):
+            a += ["--reasoning", w["effort"]]
+        if resume:
+            a += ["--resume", w["session_id"]]
+        else:
+            prompt = w["contract"] + "\n\n---\n\n" + prompt
+        return a + ["-q", prompt]
+
+
+class Antigravity(Harness):
+    name, bins, label = "agy", ("agy",), "Google Antigravity CLI"
+    effort_levels = ("low", "medium", "high")
+    models_hint = "`agy models` (e.g. gemini-3.8-flash-high, gemini-3.1-pro-high, claude-opus-4-6-thinking)"
+    auth_hint = "agy (sign in interactively once)"
+
+    def build(self, w, prompt, resume):
+        a = [self.binary(), "--output-format", "stream-json",
+             "--print-timeout", f"{int(w.get('max_minutes') or 60)}m"]
+        a += ["--mode", "plan"] if w.get("read_only") else ["--dangerously-skip-permissions"]
+        if w.get("model"):
+            a += ["--model", w["model"]]
+        if w.get("effort"):
+            a += ["--effort", w["effort"]]
+        if resume:
+            a += ["--conversation", w["session_id"]]
+        else:
+            prompt = w["contract"] + "\n\n---\n\n" + prompt
+        return a + ["-p", prompt]
+
+
+def _agy_parse(self, o):
+    ev = o.get("event")
+    if ev == "init":
+        return [dict(k="init", sid=o.get("conversation_id"), model=(o.get("init") or {}).get("model"))]
+    if ev == "step_update":
+        su = o.get("step_update") or {}
+        if su.get("step_type") == "tool":
+            ti = su.get("tool_info") or {}
+            sid = f"{su.get('conversation_id')}:{su.get('step_index')}"
+            if su.get("state") == "ACTIVE":
+                return [tool_event(ti.get("name") or su.get("tool_name"), ti.get("parameters") or {}, sid)]
+            if su.get("state") in ("DONE", "ERROR", "FAILED"):
+                out = str(ti.get("output", ""))
+                m = re.search(r"[Ee]xit code:? (\d+)", out)
+                code = int(m.group(1)) if m else (0 if su["state"] == "DONE" else 1)
+                return [dict(k="result", id=sid, exit=code, text=out)]
+        return []
+    if ev == "result":
+        r = o.get("result") or {}
+        return [dict(k="done", ok=r.get("status") == "SUCCESS", sid=r.get("conversation_id"), text=r.get("response", ""))]
+    if ev and "error" in str(ev):
+        return [dict(k="error", text=json.dumps(o)[:300])]
+    return []
+
+
+Antigravity.parse = _agy_parse
+
+
+class CommandCode(Harness):
+    name, bins, label = "command-code", ("command-code", "commandcode"), "Command Code"
+    effort_levels = ("low", "medium", "high")
+    models_hint = "-m MODEL (`command-code --list-models`)"
+    auth_hint = "command-code whoami"
+
+    def build(self, w, prompt, resume):
+        a = [self.binary(), "--trust", "--skip-onboarding", "--output-format", "json"]
+        a += ["--permission-mode", "plan"] if w.get("read_only") else ["--yolo", "--tools-all"]
+        if w.get("model"):
+            a += ["-m", w["model"]]
+        if w.get("effort"):
+            a += ["--effort", w["effort"]]
+        if resume:
+            a += ["--resume", w["session_id"]]
+        else:
+            prompt = w["contract"] + "\n\n---\n\n" + prompt
+        return a + ["-p", prompt]
+
+    def parse(self, o):
+        if o.get("type") == "result":
+            return [dict(k="done", ok=o.get("subtype") == "success", sid=o.get("sessionId"),
+                         text=o.get("finalText") or o.get("stopReason", ""))]
+        e = o.get("event") or {}
+        t = e.get("type", "")
+        if t == "run_start":
+            return [dict(k="init", sid=e.get("sessionId"))]
+        if t == "message_end":
+            out = []
+            for c in e.get("content") or []:
+                if c.get("type") == "text" and c.get("text", "").strip():
+                    out.append(dict(k="say", text=c["text"]))
+                elif c.get("type") == "tool_use":
+                    out.append(tool_event(c.get("name"), c.get("input"), c.get("id")))
+            return out
+        if t in ("tool_completed", "tool_failed", "tool_error"):
+            txt = _content_text(e.get("result") or e.get("error") or "")
+            m = re.search(r"[Ee]xit code:? (\d+)", txt)
+            code = int(m.group(1)) if m else (1 if t != "tool_completed" or e.get("isError") else 0)
+            return [dict(k="result", id=e.get("toolCallId"), exit=code, text=txt)]
+        if "error" in t:
+            return [dict(k="error", text=e.get("message") or json.dumps(e))]
+        return []
+
+
+class Aider(Harness):
+    name, bins, label = "aider", ("aider",), "Aider"
+    models_hint = "--model provider/model (`aider --list-models x`)"
+    auth_hint = "provider API key env vars"
+    stream = False
+
+    def build(self, w, prompt, resume):
+        a = [self.binary(), "--yes-always", "--no-pretty", "--no-stream", "--no-auto-commits"]
+        if w.get("model"):
+            a += ["--model", w["model"]]
+        if w.get("effort"):
+            a += ["--reasoning-effort", w["effort"]]
+        if resume:
+            a += ["--restore-chat-history"]
+            w.setdefault("session_id", "chat-history")
+        else:
+            prompt = w["contract"] + "\n\n---\n\n" + prompt
+            w["session_id"] = "chat-history"   # aider resumes via its history file
+        return a + ["--message", prompt]
+
+
+HARNESSES = {h.name: h for h in (Claude(), Codex(), Gemini(), OpenCode(), CursorAgent(), Qwen(), Copilot(), Amp(),
+                                  Droid(), Goose(), Crush(), Kiro(), Hermes(), Antigravity(), CommandCode(), Aider())}
+
+
+def harness(name):
+    h = HARNESSES.get(name)
+    if not h:
+        die(f"unknown harness '{name}'. known: {', '.join(HARNESSES)}")
+    return h
+
+
+# --------------------------------------------------------------------------
+# project / run / worker paths
+# --------------------------------------------------------------------------
+def project_root(explicit=None):
+    if explicit:
+        return Path(explicit).resolve()
+    if os.environ.get("ORCH_PROJECT"):
+        return Path(os.environ["ORCH_PROJECT"]).resolve()
+    code, out = sh(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"])
+    if code == 0 and out.strip():
+        common = Path(out.strip().splitlines()[0])
+        return common.parent if common.name == ".git" else Path.cwd()
+    return Path.cwd()
+
+
+def orch_dir(root):
+    d = root / ".orch"
+    d.mkdir(exist_ok=True)
+    exclude(root, ".orch/")
+    return d
+
+
+def exclude(root, pattern):
+    code, out = sh(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=root)
+    if code != 0:
+        return
+    ex = Path(out.strip().splitlines()[0]) / "info" / "exclude"
+    ex.parent.mkdir(parents=True, exist_ok=True)
+    txt = ex.read_text() if ex.exists() else ""
+    if pattern not in txt.split():
+        ex.write_text(txt + ("" if txt.endswith("\n") or not txt else "\n") + pattern + "\n")
+
+
+def run_dir(root, run=None):
+    od = orch_dir(root)
+    run = run or (od / "current").read_text().strip() if (run or (od / "current").exists()) else None
+    if not run:
+        die("no active run - start with `orch init <slug>`")
+    d = od / "runs" / run
+    if not d.exists():
+        die(f"run '{run}' not found in {od / 'runs'}")
+    return d
+
+
+def worker_dirs(rd):
+    wd = rd / "workers"
+    return sorted(p for p in wd.iterdir() if p.is_dir()) if wd.exists() else []
+
+
+def load_worker(wdir):
+    w = rjson(wdir / "worker.json")
+    if not w:
+        die(f"broken worker state in {wdir}")
+    return w
+
+
+def save_worker(w):
+    wjson(Path(w["dir"]) / "worker.json", w)
+
+
+def alive(pid):
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().split()[2] != "Z"
+    except OSError:
+        return True
+
+
+def refresh(w):
+    """Reconcile worker.json with process reality."""
+    if w.get("status") == "running" and not alive(w.get("sup_pid")):
+        ec = rjson(Path(w["dir"]) / f"exit.r{w['round']}.json", {})
+        w["status"] = "done" if ec.get("code") == 0 else ("stopped" if w.get("stop_requested") else "failed")
+        w["exit_code"] = ec.get("code")
+        w["ended"] = ec.get("t") or now()
+        save_worker(w)
+    return w
+
+
+# --------------------------------------------------------------------------
+# events -> normalized feed
+# --------------------------------------------------------------------------
+def read_events(w, rnd, offset=0):
+    """Yield (new_offset, normalized events) for one round from byte offset."""
+    p = Path(w["dir"]) / f"events.r{rnd}.jsonl"
+    if not p.exists():
+        return offset, []
+    h = harness(w["harness"])
+    evs = []
+    with open(p, "rb") as f:
+        f.seek(offset)
+        data = f.read()
+    cut = data.rfind(b"\n") + 1  # only complete lines
+    for raw in data[:cut].decode("utf-8", "replace").splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            o = json.loads(raw)
+            evs += h.parse(o) if isinstance(o, dict) else [dict(k="say", text=raw)]
+        except json.JSONDecodeError:
+            evs.append(dict(k="say", text=raw))
+    return offset + cut, evs
+
+
+def fmt_event(e, rnd, w=None):
+    k = e["k"]
+    if w and e.get("path"):
+        e = dict(e, path=rel_path(w, e["path"]))
+    p = f"  r{rnd} "
+    if k == "shell":
+        return p + f"$ {clip(e.get('cmd'), 150)}"
+    if k == "result":
+        if e.get("exit") and not e.get("hidden"):
+            return p + f"  └ exit {e['exit']}: {clip(e.get('text', ''), 130)}"
+        return None
+    if k == "edit":
+        return p + f"✎ {e.get('path')}"
+    if k == "read":
+        return None
+    if k == "tool":
+        return p + f"⚙ {e.get('name')} {clip(e.get('arg', ''), 100)}"
+    if k == "say":
+        return p + f"» {clip(e.get('text', ''), 220)}"
+    if k == "error":
+        return p + f"✗ ERROR {clip(e.get('text', ''), 200)}"
+    if k == "done":
+        cost = f" ${e['cost']:.2f}" if isinstance(e.get("cost"), (int, float)) else ""
+        return p + f"■ turn finished ok={e.get('ok')}{cost}: {clip(e.get('text', ''), 200)}"
+    return None
+
+
+def analyse(w, evs, st, prof, rnd=None):
+    """Update rolling watch state, return alert strings."""
+    alerts = []
+    scope = w.get("scope") or []
+    for e in evs:
+        k = e["k"]
+        st["events"] = st.get("events", 0) + 1
+        if k == "init" and e.get("sid") and not w.get("session_id"):
+            w["session_id"] = e["sid"]
+        if k == "done":
+            if e.get("sid"):
+                w["session_id"] = e["sid"]
+            if isinstance(e.get("cost"), (int, float)):
+                w["cost_usd"] = round(w.get("cost_usd", 0) + e["cost"], 4)
+            if not e.get("ok") and not (rnd and rnd < w["round"]):
+                alerts.append("TURN_FAILED - the harness reported an error result")
+            m = re.search(r"ORCH_STATUS:\s*([A-Z_]+)", str(e.get("text", "")))
+            if m:
+                w["worker_status"] = m.group(1)
+                if m.group(1) in ("BLOCKED", "NEEDS_CONTEXT", "DONE_WITH_CONCERNS", "PLAN_READY"):
+                    alerts.append(f"WORKER_{m.group(1)} - read its final message + worklog, then answer via `orch resume`")
+            elif e.get("ok"):
+                alerts.append("NO_STATUS - turn ended without an ORCH_STATUS line (unfinished or ignored the contract?)")
+            if str(e.get("text", "")).rstrip().endswith("?"):
+                alerts.append("QUESTION - worker ended its turn with a question; answer via `orch resume`")
+        if k == "say" and "ORCH_STATUS:" in str(e.get("text", "")):
+            m = re.search(r"ORCH_STATUS:\s*([A-Z_]+)", e["text"])
+            if m:
+                w["worker_status"] = m.group(1)
+        if k == "error":
+            alerts.append(f"ERROR - {clip(e.get('text'), 140)}")
+        if k == "shell":
+            cmd = e.get("cmd", "")
+            if DANGER.search(cmd):
+                alerts.append(f"DANGER - risky command: {clip(cmd, 120)}")
+            sig = "sh:" + cmd.strip()
+        elif k == "edit":
+            sig = "ed:" + e.get("path", "")
+            st.setdefault("edits", {})
+            st["edits"][e.get("path", "?")] = st["edits"].get(e.get("path", "?"), 0) + 1
+            rel = rel_path(w, e.get("path", ""))
+            if prof["scope"] and scope and not any(fnmatch.fnmatch(rel, g) for g in scope) \
+                    and not rel.startswith(".orch/"):
+                alerts.append(f"SCOPE - edit outside assigned scope: {rel}")
+            if prof["cheat"] and e.get("body") and CHEAT.search(e["body"]):
+                m = CHEAT.search(e["body"]).group(0)
+                alerts.append(f"CHEAT? - `{m}` written to {rel}{' (test file)' if TESTY.search(rel) else ''}")
+            if prof["cheat"] and TESTY.search(rel) and not any(fnmatch.fnmatch(rel, g) for g in w.get("protect") or []) \
+                    and rel not in st.setdefault("test_warned", []) and existed_at_base(w, rel):
+                st["test_warned"].append(rel)
+                alerts.append(f"TEST_EDIT - worker modified test file {rel}: check it didn't weaken assertions")
+            if rel.startswith(".orch/WORKLOG"):
+                st["worklog_touch"] = now()
+        elif k == "result":
+            if e.get("exit"):
+                st["fail_streak"] = st.get("fail_streak", 0) + 1
+                if st["fail_streak"] == prof["fail_streak"]:
+                    alerts.append(f"FAIL_STREAK - {st['fail_streak']} failing commands in a row")
+            else:
+                st["fail_streak"] = 0
+            continue
+        else:
+            continue
+        recent = st.setdefault("recent", [])
+        recent.append(sig)
+        del recent[:-12]
+        first = recent.index(sig)
+        no_progress = not any(x.startswith("ed:") for x in recent[first:])  # nothing edited in between
+        if recent.count(sig) == prof["loop"] and no_progress and k == "shell" and not INSPECT.match(sig[3:]):
+            alerts.append(f"LOOP - same action {prof['loop']}x recently: {clip(sig[3:], 100)}")
+    for path, n in (st.get("edits") or {}).items():
+        if n >= 8 and path not in st.setdefault("churn_warned", []):
+            st["churn_warned"].append(path)
+            alerts.append(f"CHURN - {rel_path(w, path)} edited {n}x (thrashing?)")
+    return alerts
+
+
+def existed_at_base(w, rel):
+    if not w.get("base_commit"):
+        return True
+    return sh(["git", "cat-file", "-e", f"{w['base_commit']}:{rel}"], cwd=w["cwd"])[0] == 0
+
+
+def rel_path(w, p):
+    try:
+        return str(Path(p).resolve().relative_to(Path(w["cwd"]).resolve()))
+    except (ValueError, OSError):
+        return str(p)
+
+
+def worklog_path(w):
+    return Path(w["cwd"]) / ".orch" / f"WORKLOG-{w['name']}.md"
+
+
+# --------------------------------------------------------------------------
+# commands
+# --------------------------------------------------------------------------
+def cmd_detect(a):
+    def probe(h):
+        path = h.binary()
+        if not path:
+            return dict(name=h.name, label=h.label, installed=False)
+        return dict(name=h.name, label=h.label, installed=True, path=path, version=h.version(path),
+                    auth=h.auth(), steer=h.steer, effort=list(h.effort_levels),
+                    models=h.models_hint, auth_hint=h.auth_hint)
+    with concurrent.futures.ThreadPoolExecutor(8) as ex:
+        res = list(ex.map(probe, HARNESSES.values()))
+    local = []
+    for name, url in (("ollama", "http://127.0.0.1:11434/api/tags"), ("llama-server/vLLM", "http://127.0.0.1:8080/v1/models"),
+                      ("vLLM", "http://127.0.0.1:8000/v1/models"), ("LM Studio", "http://127.0.0.1:1234/v1/models")):
+        code, out = sh(["curl", "-s", "-m", "1", url], timeout=3)
+        if code == 0 and out.strip().startswith("{"):
+            local.append(name + " @ " + url.rsplit("/", 2)[0])
+    if a.json:
+        print(json.dumps(dict(harnesses=res, local_endpoints=local), indent=1))
+        return
+    inst = [r for r in res if r["installed"]]
+    print(f"INSTALLED HARNESSES ({len(inst)}):")
+    for r in inst:
+        au = {True: "auth ok", False: "NOT AUTHENTICATED", None: "auth ?"}[r["auth"]]
+        eff = "/".join(r["effort"]) or "-"
+        print(f"  {r['name']:<13} {r['version']:<28} {au:<18} steer={r['steer']:<7} effort={eff}")
+        print(f"  {'':<13} models: {r['models']}")
+    missing = [r["name"] for r in res if not r["installed"]]
+    print("NOT INSTALLED: " + ", ".join(missing))
+    print("LOCAL MODEL ENDPOINTS: " + (", ".join(local) or "none"))
+
+
+def cmd_init(a):
+    root = project_root(a.dir)
+    od = orch_dir(root)
+    slug = re.sub(r"[^a-z0-9]+", "-", a.slug.lower()).strip("-")[:40] or "run"
+    run = time.strftime("%Y%m%d-%H%M%S-") + slug
+    rd = od / "runs" / run
+    (rd / "workers").mkdir(parents=True)
+    s = int(a.strictness)
+    if s not in STRICTNESS:
+        die("strictness must be 1..4")
+    code, head = sh(["git", "rev-parse", "HEAD"], cwd=root)
+    wjson(rd / "run.json", dict(
+        id=run, root=str(root), created=now(), strictness=s, profile=STRICTNESS[s],
+        harness=a.harness, model=a.model, effort=a.effort, provider=a.provider,
+        base_commit=head.strip() if code == 0 else None))
+    tpl = (SKILL_DIR / "templates" / "PLAN.md").read_text()
+    (rd / "PLAN.md").write_text(tpl.replace("{{RUN}}", run).replace("{{STRICTNESS}}", f"{s} ({STRICTNESS[s]['name']})"))
+    (od / "current").write_text(run)
+    print(f"RUN {run}\nDIR {rd}\nPLAN {rd / 'PLAN.md'}")
+    if code != 0:
+        print("WARN: not a git repo - diffs, worktrees and rollback are unavailable. Consider `git init` first.")
+    else:
+        code, dirty = sh(["git", "status", "--porcelain"], cwd=root)
+        if dirty.strip():
+            print(f"WARN: working tree has {len(dirty.splitlines())} uncommitted change(s); commit or stash so worker diffs stay attributable.")
+
+
+def build_contract(w, rd):
+    tpl = (SKILL_DIR / "templates" / "worker-contract.md").read_text()
+    run = rjson(rd / "run.json", {})
+    s = run.get("strictness", 2)
+    rep = {
+        "{{WORKER}}": w["name"], "{{WORKLOG}}": str(worklog_path(w)),
+        "{{SCOPE}}": (", ".join(w.get("scope") or []) or "whatever the task requires (stay minimal)")
+                     + (f". Read-only (protected): {', '.join(w['protect'])}" if w.get("protect") else ""),
+        "{{COMMIT_RULE}}": ("Commit your work to the current branch with clear messages when a coherent step is done "
+                            "(you are in a dedicated git worktree)." if w.get("worktree")
+                            else "Do NOT commit, push, or rewrite git history - the orchestrator handles git."),
+        "{{STRICTNESS}}": f"{s} ({STRICTNESS[s]['name']})",
+        "{{STEER}}": ("Messages tagged [ORCHESTRATOR] may appear in your context while you work. They come from your "
+                      "supervisor: acknowledge them in one line and follow them immediately."
+                      if harness(w["harness"]).steer == "hook" else
+                      f"Your supervisor may interrupt and resume you with a message tagged [ORCHESTRATOR]; "
+                      f"follow it immediately. Also re-read {Path(w['cwd']) / '.orch' / ('INBOX-' + w['name'] + '.md')} "
+                      "(if it exists) after each completed step and follow new entries."),
+    }
+    for k, v in rep.items():
+        tpl = tpl.replace(k, v)
+    if w.get("read_only"):
+        tpl += ("\n\n## You are a READ-ONLY REVIEWER\nDo not modify any project file. You may run read-only commands, "
+                "builds and tests. Write your findings to your worklog and final message, each with severity "
+                "(critical/high/medium/low), evidence (file:line or command+output) and a concrete fix.\n")
+    return tpl
+
+
+def spawn(w, prompt, resume):
+    h = harness(w["harness"])
+    if not h.binary():
+        die(f"{w['harness']} is not installed")
+    w["round"] = w.get("round", 0) + 1
+    r = w["round"]
+    wd = Path(w["dir"])
+    (wd / f"prompt.r{r}.md").write_text(prompt)
+    argv = h.build(w, prompt, resume)
+    w.update(status="running", started=now(), ended=None, exit_code=None, stop_requested=False,
+             argv_preview=clip(" ".join(shlex.quote(x) for x in argv[:-1]) + " <prompt>", 400))
+    wjson(wd / f"argv.r{r}.json", argv)
+    save_worker(w)
+    sup = subprocess.Popen([sys.executable, ORCH_BIN, "_supervise", str(wd), str(r)],
+                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           start_new_session=True, cwd=w["cwd"])
+    w["sup_pid"] = sup.pid
+    save_worker(w)
+    return w
+
+
+def cmd_supervise(a):
+    """Internal: runs detached, owns one harness process for one round."""
+    wd = Path(a.wdir)
+    r = int(a.round)
+    w = load_worker(wd)
+    argv = rjson(wd / f"argv.r{r}.json")
+    env = dict(os.environ, ORCH_WORKER_DIR=str(wd), ORCH_WORKER=w["name"], ORCH_ROUND=str(r),
+               CI="1", NO_COLOR="1", TERM="dumb", **harness(w["harness"]).env)
+    env.pop("CLAUDECODE", None)  # allow nested claude
+    with open(wd / f"events.r{r}.jsonl", "ab") as out, open(wd / f"stderr.r{r}.log", "ab") as err:
+        p = subprocess.Popen(argv, cwd=w["cwd"], stdin=subprocess.DEVNULL, stdout=out, stderr=err, env=env)
+        w = load_worker(wd)
+        w["pid"] = p.pid
+        save_worker(w)
+        deadline = now() + 60 * float(w.get("max_minutes") or 120)
+
+        def on_term(*_):
+            try:
+                p.send_signal(signal.SIGINT)
+                p.wait(8)
+            except subprocess.TimeoutExpired:
+                p.terminate()
+                try:
+                    p.wait(5)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+            wjson(wd / f"exit.r{r}.json", dict(code=p.poll() if p.poll() is not None else -15, t=now(), stopped=True))
+            sys.exit(0)
+        signal.signal(signal.SIGTERM, on_term)
+        while p.poll() is None:
+            if now() > deadline:
+                err.write(f"\n[orch] max_minutes exceeded, stopping\n".encode())
+                on_term()
+            time.sleep(1)
+    wjson(wd / f"exit.r{r}.json", dict(code=p.returncode, t=now()))
+
+
+def cmd_start(a):
+    root = project_root(a.dir)
+    rd = run_dir(root, a.run)
+    run = rjson(rd / "run.json")
+    name = re.sub(r"[^A-Za-z0-9_-]+", "-", a.name)
+    wd = rd / "workers" / name
+    if wd.exists():
+        die(f"worker '{name}' exists - use `orch resume {name}` or another name")
+    wd.mkdir(parents=True)
+    task = Path(a.task_file).read_text() if a.task_file else (a.task or "")
+    if not task.strip():
+        die("give --task-file FILE or --task TEXT")
+    cwd = Path(a.cwd).resolve() if a.cwd else root
+    branch = None
+    if a.worktree:
+        branch = f"orch/{run['id'][-24:]}/{name}"
+        cwd = root / ".orch" / "wt" / f"{run['id'][:15]}-{name}"
+        code, out = sh(["git", "worktree", "add", "-b", branch, str(cwd)], cwd=root, timeout=60)
+        if code != 0:
+            die("git worktree add failed:\n" + out)
+    (cwd / ".orch").mkdir(parents=True, exist_ok=True)
+    code, head = sh(["git", "rev-parse", "HEAD"], cwd=cwd)
+    w = dict(name=name, dir=str(wd), run=run["id"], cwd=str(cwd),
+             harness=a.harness or run.get("harness") or "claude",
+             model=a.model if a.model is not None else run.get("model"),
+             effort=a.effort if a.effort is not None else run.get("effort"),
+             provider=a.provider or run.get("provider"),
+             permission_mode=a.permission_mode, max_minutes=a.max_minutes,
+             scope=[g.strip() for g in (a.scope or "").split(",") if g.strip()],
+             protect=[g.strip() for g in (a.protect or "").split(",") if g.strip()] + (["**"] if a.read_only else []),
+             read_only=bool(a.read_only),
+             worktree=bool(a.worktree), branch=branch,
+             base_commit=head.strip() if code == 0 else None, round=0, cost_usd=0)
+    if a.protect_existing_tests:
+        code, files = sh(["git", "ls-files"], cwd=cwd, timeout=30)
+        w["protect"] += [f for f in files.splitlines() if TESTY.search(f)]
+    w["contract"] = build_contract(w, rd)
+    save_worker(w)
+    wl = worklog_path(w)
+    if not wl.exists():
+        wl.write_text((SKILL_DIR / "templates" / "WORKLOG.md").read_text().replace("{{WORKER}}", name))
+    spawn(w, task, resume=False)
+    print(f"STARTED {name}  harness={w['harness']} model={w['model'] or 'default'} effort={w['effort'] or 'default'}")
+    print(f"  cwd={cwd}{'  branch=' + branch if branch else ''}")
+    print(f"  worklog={wl}\n  steer={harness(w['harness']).steer}")
+
+
+def cmd_resume(a):
+    root = project_root(a.dir)
+    rd = run_dir(root, a.run)
+    w = refresh(load_worker(rd / "workers" / a.name))
+    if w["status"] == "running":
+        if not a.force:
+            die(f"{a.name} is still running - use `orch steer` or pass --force to stop it first")
+        stop_worker(w)
+    if not w.get("session_id"):
+        die(f"{a.name} has no session id yet (harness never reported one) - cannot resume")
+    msg = Path(a.message_file).read_text() if a.message_file else a.message
+    if not msg:
+        die("give a message or --message-file")
+    spawn(w, "[ORCHESTRATOR]\n" + msg, resume=True)
+    print(f"RESUMED {a.name} round {w['round']} (session {w['session_id']})")
+
+
+def stop_worker(w):
+    w["stop_requested"] = True
+    save_worker(w)
+    if alive(w.get("sup_pid")):
+        os.kill(w["sup_pid"], signal.SIGTERM)
+        for _ in range(30):
+            if not alive(w["sup_pid"]):
+                break
+            time.sleep(0.5)
+    refresh(w)
+
+
+def cmd_stop(a):
+    root = project_root(a.dir)
+    rd = run_dir(root, a.run)
+    names = [a.name] if a.name != "all" else [p.name for p in worker_dirs(rd)]
+    for n in names:
+        w = load_worker(rd / "workers" / n)
+        stop_worker(w)
+        print(f"STOPPED {n} ({w['status']})")
+
+
+def cmd_steer(a):
+    root = project_root(a.dir)
+    rd = run_dir(root, a.run)
+    w = refresh(load_worker(rd / "workers" / a.name))
+    msg = a.message.strip()
+    h = harness(w["harness"])
+    stamp = f"[ORCHESTRATOR {hms()}] {msg}"
+    if w["status"] != "running":
+        die(f"{a.name} is {w['status']} - use `orch resume {a.name} \"...\"` to continue it", 3)
+    mode = a.mode or ("hook" if h.steer == "hook" else "soft")
+    if mode == "hook":
+        with open(Path(w["dir"]) / "inbox.md", "a") as f:
+            f.write(stamp + "\n")
+        print(f"QUEUED for {a.name}: delivered after its next tool call (or before it stops).")
+    elif mode == "soft":
+        ib = Path(w["cwd"]) / ".orch" / f"INBOX-{w['name']}.md"
+        with open(ib, "a") as f:
+            f.write(stamp + "\n")
+        print(f"WROTE {ib} - {w['harness']} reads it after its next step. Use --mode hard if it must stop now.")
+    else:  # hard: interrupt + resume
+        if not w.get("session_id"):
+            die("no session id yet - wait for the first events or stop + restart the worker")
+        stop_worker(w)
+        spawn(w, stamp + "\n\nYou were interrupted by your supervisor. Apply the message above, then continue the task "
+              "from where you stopped (check your worklog and `git status`).", resume=True)
+        print(f"INTERRUPTED + RESUMED {a.name} as round {w['round']}")
+    w.setdefault("steers", []).append(dict(t=now(), mode=mode, msg=msg))
+    save_worker(w)
+
+
+MUTATORS = re.compile(r"^(sudo\s+)?(rm|mv|truncate|unlink|shred|chmod|tee|dd|install|ln|sed\s+(-[a-zA-Z]*\s+)*-[a-zA-Z]*i|"
+                      r"perl\s+-[a-zA-Z]*i|git\s+(checkout|restore|rm|mv)|cp|rsync)\b")
+REDIRECT = re.compile(r"\d*>>?\s*([^\s;&|<>]+)")
+
+
+def shell_write_targets(cmd):
+    """Paths a shell command may write: redirect targets + args of mutating verbs."""
+    targets = [t for t in REDIRECT.findall(cmd) if not t.startswith("&") and t != "/dev/null"]
+    for seg in re.split(r"&&|\|\||;|\|", cmd):
+        seg = seg.strip()
+        if MUTATORS.match(seg):
+            try:
+                args = [x for x in shlex.split(seg)[1:] if not x.startswith("-")]
+            except ValueError:
+                args = seg.split()[1:]
+            targets += args[-1:] if re.match(r"^(sudo\s+)?(cp|rsync|install|ln)\b", seg) else args
+    return targets
+
+
+def guard(w, tool, inp):
+    """Return a deny reason if a tool call touches held-out or protected paths."""
+    if not w:
+        return None
+    blob = json.dumps(inp, ensure_ascii=False)
+    runs = str(Path(w["dir"]).parent.parent.parent)  # <root>/.orch/runs
+    if runs in blob or ".orch/runs" in blob:
+        return "orchestrator-private files are off limits. Work only from your task and worklog."
+    protect = w.get("protect") or []
+    if not protect:
+        return None
+    wl = str(worklog_path(w))
+    t = tool.lower()
+    if t in EDIT_TOOLS or t.endswith("edit") or t.endswith("write"):
+        path = inp.get("file_path") or inp.get("path") or inp.get("notebook_path") or ""
+        rel = rel_path(w, path)
+        if str(Path(w["cwd"], path)) != wl and any(fnmatch.fnmatch(rel, g) for g in protect):
+            if w.get("read_only"):
+                return "you are a read-only reviewer: report findings in your worklog and final message, do not edit files."
+            return (f"{rel} is protected (read-only for workers). If you believe it is wrong, explain why in your "
+                    "worklog under Open issues and continue - the orchestrator decides.")
+    if t in SHELL_TOOLS:
+        cmd = str(inp.get("command", ""))
+        roots = {g.split("*")[0].rstrip("/") for g in protect if g.split("*")[0].strip("/")}
+        for tgt in shell_write_targets(cmd):
+            if w.get("read_only") and (tgt.startswith("/tmp/") or tgt.startswith("/dev/")):
+                continue
+            rel = rel_path(w, os.path.join(w["cwd"], tgt))
+            if any(fnmatch.fnmatch(rel, g) for g in protect) or any(rel == r or rel.startswith(r + "/") for r in roots):
+                return f"this command would modify protected path {rel}. Protected files are read-only."
+    return None
+
+
+def cmd_hook(a):
+    """Internal: Claude Code hook. post -> inject inbox; stop -> block if inbox or worklog missing."""
+    wd = Path(a.wdir)
+    try:
+        payload = json.load(sys.stdin)
+    except Exception:  # noqa: BLE001
+        payload = {}
+    if a.event == "pre":
+        reason = guard(rjson(wd / "worker.json", {}), payload.get("tool_name", ""), payload.get("tool_input") or {})
+        if reason:
+            print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                                     "permissionDecisionReason": "[ORCHESTRATOR GUARD] " + reason}}))
+        return
+    inbox = wd / "inbox.md"
+    msg = ""
+    if inbox.exists():
+        msg = inbox.read_text().strip()
+        inbox.write_text("")
+    if a.event == "post":
+        if msg:
+            print(json.dumps({"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": msg}}))
+        return
+    # stop
+    if msg:
+        print(json.dumps({"decision": "block", "reason": msg}))
+        return
+    w = rjson(wd / "worker.json", {})
+    run = rjson(wd.parent.parent / "run.json", {})
+    prof = STRICTNESS.get(run.get("strictness", 2), STRICTNESS[2])
+    if prof["enforce_worklog"] and not payload.get("stop_hook_active") and w:
+        wl = worklog_path(w)
+        started = w.get("started") or 0
+        if not wl.exists() or wl.stat().st_mtime < started:
+            print(json.dumps({"decision": "block", "reason":
+                              f"[ORCHESTRATOR] Before you finish, update your worklog {wl} for this round "
+                              "(Status, Done, Decisions, Verification with exact commands + results, Open issues, Handoff)."}))
+
+
+def cmd_watch(a):
+    root = project_root(a.dir)
+    rd = run_dir(root, a.run)
+    run = rjson(rd / "run.json")
+    prof = STRICTNESS[run.get("strictness", 2)]
+    timeout = a.timeout or prof["watch"]
+    t0 = now()
+    names = set(a.workers.split(",")) if a.workers else None
+    buf = {}
+    alerts = {}
+    finished = set()
+    while True:
+        for wdir in worker_dirs(rd):
+            if names and wdir.name not in names:
+                continue
+            w = refresh(load_worker(wdir))
+            st = rjson(wdir / "watch.json", {}) or {}
+            off = st.setdefault("offsets", {})
+            for rnd in range(1, w["round"] + 1):
+                o, evs = read_events(w, rnd, off.get(str(rnd), 0))
+                off[str(rnd)] = o
+                if evs:
+                    st["last_event"] = now()
+                    lines = [x for x in (fmt_event(e, rnd, w) for e in evs) if x]
+                    buf.setdefault(w["name"], []).extend(lines)
+                    al = analyse(w, evs, st, prof, rnd)
+                    if al:
+                        alerts.setdefault(w["name"], []).extend(al)
+            h = harness(w["harness"])
+            if not w.get("session_id") and h.stderr_sid:
+                errf = Path(w["dir"]) / f"stderr.r{w['round']}.log"
+                m = h.stderr_sid.search(errf.read_text(errors="replace")) if errf.exists() else None
+                if m:
+                    w["session_id"] = m.group(1)
+            if not h.stream and w.get("base_commit"):
+                pulse = diff_pulse(w)
+                seen = st.setdefault("pulse", {})
+                changed = [f for f, sig in pulse.items() if seen.get(f) != sig]
+                if changed:
+                    st["last_event"] = now()
+                    buf.setdefault(w["name"], []).extend(f"  r{w['round']} ✎ {f} (diff pulse)" for f in changed)
+                    for f in changed:
+                        st.setdefault("edits", {})[f] = st["edits"].get(f, 0) + 1
+                        if f.startswith(".orch/WORKLOG"):
+                            st["worklog_touch"] = now()
+                    seen.update(pulse)
+            if w["status"] == "running":
+                last = st.get("last_event") or w.get("started") or now()
+                if now() - last > prof["idle"] and not st.get("idle_warned"):
+                    st["idle_warned"] = True
+                    alerts.setdefault(w["name"], []).append(f"IDLE - no events for {dur(now() - last)} (hung? waiting for input?)")
+                wl = worklog_path(w)
+                edits = sum((st.get("edits") or {}).values())
+                wl_age = now() - (wl.stat().st_mtime if wl.exists() else w.get("started", now()))
+                if prof["stale_doc"] and edits >= 3 and wl_age > prof["stale_doc"] and now() - st.get("doc_warned", 0) > prof["stale_doc"]:
+                    st["doc_warned"] = now()
+                    alerts.setdefault(w["name"], []).append(f"STALE_DOC - worklog untouched for {dur(wl_age)} while editing code")
+            elif st.get("reported_round") != w["round"]:
+                st["reported_round"] = w["round"]
+                finished.add(w["name"])
+            if st.get("last_event"):
+                st["idle_warned"] = st.get("idle_warned") and now() - st["last_event"] > prof["idle"]
+            save_worker(w)
+            wjson(wdir / "watch.json", st)
+        n_lines = sum(len(v) for v in buf.values())
+        if alerts or finished or (now() - t0 >= timeout) or (n_lines >= a.max_lines):
+            break
+        if not any(load_worker(d)["status"] == "running" for d in worker_dirs(rd)):
+            break
+        time.sleep(2)
+    print_status(rd, brief=True)
+    for name in sorted(set(buf) | set(alerts) | finished):
+        lines = buf.get(name, [])
+        if lines:
+            skipped = max(0, len(lines) - a.max_lines)
+            print(f"\n── {name} ({len(lines)} new{', showing last ' + str(a.max_lines) if skipped else ''}) ──")
+            print("\n".join(lines[-a.max_lines:]))
+        for al in alerts.get(name, []):
+            print(f"!! {name}: {al}")
+        if name in finished:
+            w = load_worker(rd / "workers" / name)
+            print(f"== {name} FINISHED round {w['round']}: {w['status']} (exit {w.get('exit_code')}) -> review now")
+    if not buf and not alerts and not finished:
+        print("\n(no new activity)")
+
+
+def diff_pulse(w):
+    """file -> short change signature, for harnesses without an event stream."""
+    code, out = sh(["git", "diff", "--numstat", w["base_commit"]], cwd=w["cwd"], timeout=20)
+    res = {ln.split("\t")[2]: ln.split("\t")[0] + "+" + ln.split("\t")[1] + "-"
+           for ln in out.splitlines() if ln.count("\t") >= 2} if code == 0 else {}
+    code, un = sh(["git", "ls-files", "--others", "--exclude-standard"], cwd=w["cwd"], timeout=20)
+    for f in un.splitlines() if code == 0 else []:
+        try:
+            res[f] = "new:" + str(int((Path(w["cwd"]) / f).stat().st_mtime))
+        except OSError:
+            pass
+    return res
+
+
+def print_status(rd, brief=False):
+    run = rjson(rd / "run.json")
+    rows = []
+    for wdir in worker_dirs(rd):
+        w = refresh(load_worker(wdir))
+        st = rjson(wdir / "watch.json", {}) or {}
+        el = (w.get("ended") or now()) - (w.get("started") or now())
+        wl = worklog_path(w)
+        wl_age = dur(now() - wl.stat().st_mtime) if wl.exists() else "missing"
+        cost = f"${w['cost_usd']:.2f}" if w.get("cost_usd") else "-"
+        rows.append(f"  {w['name']:<14} {w['status']:<8} r{w['round']}  {dur(el):>7}  {st.get('events', 0):>4} ev  "
+                    f"worklog {wl_age:<8} {cost:>6}  {w['harness']}/{w.get('model') or 'default'}"
+                    + (f"  [{w['worker_status']}]" if w.get("worker_status") else ""))
+    print(f"RUN {run['id']}  strictness {run['strictness']} ({STRICTNESS[run['strictness']]['name']})  {hms()}")
+    print("\n".join(rows) if rows else "  (no workers yet)")
+
+
+def cmd_status(a):
+    print_status(run_dir(project_root(a.dir), a.run))
+
+
+def cmd_log(a):
+    rd = run_dir(project_root(a.dir), a.run)
+    w = load_worker(rd / "workers" / a.name)
+    rounds = [a.round] if a.round else range(1, w["round"] + 1)
+    lines = []
+    for r in rounds:
+        _, evs = read_events(w, r, 0)
+        for e in evs:
+            if a.full and e["k"] in ("say", "think", "result", "read"):
+                lines.append(f"  r{r} [{e['k']}] {clip(e.get('text') or e.get('path', ''), 600)}")
+            else:
+                x = fmt_event(e, r, w)
+                if x:
+                    lines.append(x)
+    print("\n".join(lines[-a.tail:]))
+    err = Path(w["dir"]) / f"stderr.r{w['round']}.log"
+    if err.exists() and err.stat().st_size and a.stderr:
+        print("\n── stderr (tail) ──\n" + "\n".join(err.read_text(errors="replace").splitlines()[-20:]))
+
+
+def cmd_diff(a):
+    rd = run_dir(project_root(a.dir), a.run)
+    w = load_worker(rd / "workers" / a.name)
+    base = w.get("base_commit")
+    if not base:
+        die("worker has no base commit (not a git repo)")
+    args = ["git", "diff", base, "--", ".", ":(exclude).orch"]
+    if a.stat:
+        args.insert(3, "--stat")
+    code, out = sh(args, cwd=w["cwd"], timeout=60)
+    print(out)
+    code, un = sh(["git", "ls-files", "--others", "--exclude-standard"], cwd=w["cwd"])
+    new = [x for x in un.splitlines() if not x.startswith(".orch/") and not JUNK.search(x)]
+    if new:
+        print("UNTRACKED NEW FILES:\n  " + "\n  ".join(new))
+
+
+def cmd_doc(a):
+    rd = run_dir(project_root(a.dir), a.run)
+    w = load_worker(rd / "workers" / a.name)
+    wl = worklog_path(w)
+    if not wl.exists():
+        print(f"WORKLOG MISSING: {wl}")
+        return
+    txt = wl.read_text()
+    need = ["Status", "Done", "Decisions", "Verification", "Open issues", "Handoff"]
+    miss = [s for s in need if not re.search(rf"^#+\s*{s}", txt, re.M | re.I)]
+    print(f"WORKLOG {wl}  ({len(txt)} chars, updated {dur(now() - wl.stat().st_mtime)} ago)")
+    parts = re.split(r"^#{2,}\s*(.+)$", txt, flags=re.M)
+    empty = [parts[i].strip() for i in range(1, len(parts) - 1, 2)
+             if parts[i].strip().lower() != "status" and not parts[i + 1].strip()]
+    tpl = (SKILL_DIR / "templates" / "WORKLOG.md").read_text().replace("{{WORKER}}", w["name"])
+    if txt.strip() == tpl.strip():
+        print("!! WORKLOG UNTOUCHED - the worker never documented anything (blocking at strictness >= 2)")
+    print("missing sections: " + (", ".join(miss) or "none") + " | empty sections: " + (", ".join(empty) or "none"))
+    if re.search(r"\{\{|TBD|<fill", txt):
+        print("contains unfilled placeholders")
+    print("─" * 60)
+    print(txt if len(txt) < a.max_chars else txt[: a.max_chars] + f"\n… [{len(txt) - a.max_chars} more chars]")
+
+
+def cmd_smoke(a):
+    h = harness(a.harness)
+    if not h.binary():
+        die(f"{a.harness} not installed")
+    import tempfile
+    tmp = Path(tempfile.mkdtemp(prefix="orch-smoke-"))
+    w = dict(name="smoke", dir=str(tmp), cwd=str(tmp), harness=h.name, model=a.model, effort=a.effort,
+             provider=a.provider, contract="You are a smoke test. Do not use tools.", max_minutes=2)
+    wjson(tmp / "worker.json", w)
+    argv = h.build(w, "Reply with exactly: ORCH_OK", resume=False)
+    env = dict(os.environ, CI="1", NO_COLOR="1")
+    env.pop("CLAUDECODE", None)
+    t0 = now()
+    try:
+        p = subprocess.run(argv, cwd=tmp, capture_output=True, text=True, timeout=a.timeout, env=env,
+                           stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        print(f"SMOKE FAIL {h.name}: timeout after {a.timeout}s")
+        sys.exit(1)
+    evs, sid = [], None
+    for ln in p.stdout.splitlines():
+        try:
+            o = json.loads(ln)
+            evs += h.parse(o) if isinstance(o, dict) else []
+        except json.JSONDecodeError:
+            evs.append(dict(k="say", text=ln))
+    for e in evs:
+        sid = e.get("sid") or sid
+    if not sid and h.stderr_sid:
+        m = h.stderr_sid.search(p.stderr or "")
+        sid = m.group(1) if m else None
+    text = " ".join(e.get("text", "") for e in evs if e["k"] in ("say", "done"))
+    ok = p.returncode == 0 and "ORCH_OK" in text
+    print(f"SMOKE {'PASS' if ok else 'FAIL'} {h.name} model={a.model or 'default'} in {dur(now() - t0)}  "
+          f"exit={p.returncode} events={len(evs)} session_id={'yes' if sid else 'NO (resume/feedback rounds unavailable)'}")
+    if not ok:
+        print("stdout: " + clip(p.stdout, 400))
+        print("stderr: " + clip(p.stderr, 400))
+        sys.exit(1)
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def cmd_merge(a):
+    root = project_root(a.dir)
+    rd = run_dir(root, a.run)
+    w = load_worker(rd / "workers" / a.name)
+    if not w.get("branch"):
+        die("worker ran in place (no worktree) - its changes are already in the working tree")
+    sh(["git", "add", "-u", "--", ".", ":(exclude).orch"], cwd=w["cwd"])
+    code, un = sh(["git", "ls-files", "--others", "--exclude-standard"], cwd=w["cwd"])
+    new = [x for x in un.splitlines() if not x.startswith(".orch/") and not JUNK.search(x)]
+    if new:
+        sh(["git", "add", "--"] + new, cwd=w["cwd"])
+    if sh(["git", "diff", "--cached", "--quiet"], cwd=w["cwd"])[0] != 0:
+        sh(["git", "commit", "-m", f"orch: {w['name']} uncommitted work"], cwd=w["cwd"])
+    code, out = sh(["git", "merge", "--no-ff", "-m", f"orch: merge {w['name']}", w["branch"]], cwd=root, timeout=60)
+    print(out)
+    sys.exit(code)
+
+
+def cmd_clean(a):
+    root = project_root(a.dir)
+    rd = run_dir(root, a.run)
+    for wdir in worker_dirs(rd):
+        w = load_worker(wdir)
+        if alive(w.get("sup_pid")):
+            stop_worker(w)
+        if w.get("worktree"):
+            code, out = sh(["git", "worktree", "remove", "--force", w["cwd"]], cwd=root, timeout=60)
+            print(f"worktree {w['cwd']}: {'removed' if code == 0 else out.strip()}")
+            if a.branches and w.get("branch"):
+                sh(["git", "branch", "-D", w["branch"]], cwd=root)
+    print("clean done (run logs kept in " + str(rd) + ")")
+
+
+def cmd_help(_a):
+    print(__doc__)
+    print("""commands:
+  detect [--json]                       installed harnesses, versions, auth, steering channel, local endpoints
+  smoke HARNESS [-m M] [-e E]           one cheap headless call: exit code, event parsing, session id
+  init SLUG -s 1..4 [-H h -m m -e e]    new run (+ PLAN.md template), becomes current
+  start NAME (--task-file F|--task T) [-H h -m m -e e] [--worktree] [--scope 'src/**,tests/**'] [--max-minutes N]
+  watch [--timeout S] [--workers a,b]   block until new activity/alerts/finish; prints condensed feed
+  steer NAME "msg" [--mode hook|soft|hard]
+  resume NAME "msg" | --message-file F  next round on the same session (feedback)
+  status | log NAME [--full --tail N] | diff NAME [--stat] | doc NAME
+  stop NAME|all | merge NAME | clean [--branches]
+global: --dir PROJECT --run RUN_ID""")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="orch", add_help=False)
+    ap.add_argument("--dir")
+    ap.add_argument("--run")
+    sp = ap.add_subparsers(dest="cmd")
+
+    def add(name, fn, *args):
+        p = sp.add_parser(name, add_help=False)
+        p.set_defaults(fn=fn)
+        for spec in args:
+            flags, kw = spec
+            p.add_argument(*flags, **kw)
+        return p
+
+    hm = [(("-H", "--harness"), {}), (("-m", "--model"), {}), (("-e", "--effort"), {}), (("--provider",), {})]
+    add("help", cmd_help)
+    add("detect", cmd_detect, (("--json",), dict(action="store_true")))
+    add("smoke", cmd_smoke, (("harness",), {}), (("-m", "--model"), {}), (("-e", "--effort"), {}),
+        (("--provider",), {}), (("--timeout",), dict(type=int, default=120)))
+    add("init", cmd_init, (("slug",), {}), (("-s", "--strictness"), dict(default=2)), *hm)
+    add("start", cmd_start, (("name",), {}), (("--task-file",), {}), (("--task",), {}), *hm,
+        (("--cwd",), {}), (("--worktree",), dict(action="store_true")), (("--scope",), {}), (("--protect",), {}),
+        (("--protect-existing-tests",), dict(action="store_true")), (("--read-only",), dict(action="store_true")),
+        (("--permission-mode",), {}), (("--max-minutes",), dict(type=float, default=120)))
+    add("watch", cmd_watch, (("--timeout",), dict(type=int)), (("--workers",), {}),
+        (("--max-lines",), dict(type=int, default=40)))
+    add("steer", cmd_steer, (("name",), {}), (("message",), {}), (("--mode",), dict(choices=["hook", "soft", "hard"])))
+    add("resume", cmd_resume, (("name",), {}), (("message",), dict(nargs="?")), (("--message-file",), {}),
+        (("--force",), dict(action="store_true")))
+    add("stop", cmd_stop, (("name",), {}))
+    add("status", cmd_status)
+    add("log", cmd_log, (("name",), {}), (("--round",), dict(type=int)), (("--full",), dict(action="store_true")),
+        (("--tail",), dict(type=int, default=80)), (("--stderr",), dict(action="store_true")))
+    add("diff", cmd_diff, (("name",), {}), (("--stat",), dict(action="store_true")))
+    add("doc", cmd_doc, (("name",), {}), (("--max-chars",), dict(type=int, default=6000)))
+    add("merge", cmd_merge, (("name",), {}))
+    add("clean", cmd_clean, (("--branches",), dict(action="store_true")))
+    add("_supervise", cmd_supervise, (("wdir",), {}), (("round",), {}))
+    add("_hook", cmd_hook, (("event",), {}), (("wdir",), {}))
+    a = ap.parse_args()
+    if not getattr(a, "fn", None):
+        cmd_help(a)
+        return
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()
